@@ -11,7 +11,7 @@ HTTP client → Wi-Fi → ESP32-C3 → BLE → iDotMatrix display
 - Reconnects to the display on its own after it restarts or drops the link
 - HTTP stays available while the display is disconnected
 - Stores up to 10 PNGs in flash, replacing the oldest first
-- Rejects PNGs over 2,923 bytes, because the display silently ignores larger ones (3,012 bytes failed)
+- Rejects PNGs over 3,663 bytes, the largest size confirmed working (a 4,196 byte PNG sent as two chunks wasn't shown)
 - Remembers the display mode across restarts
 - Firmware updates over Wi-Fi
 

@@ -63,8 +63,8 @@ static BLEUUID writeCharUUID("0000fa02-0000-1000-8000-00805f9b34fb");
 
 // Images are kept in LittleFS as /img<slot>.png, the oldest slot gets replaced first
 const int max_files = 10;
-// Largest size seen working, the display acknowledges but ignores a 3012 byte PNG
-const size_t max_png_size = 2923;
+// Largest size seen working, a 4196 byte PNG sent as two chunks isn't shown
+const size_t max_png_size = 3663;
 int next_upload_slot = 0;
 int current_display_file = 0;
 
@@ -139,6 +139,7 @@ bool sendCommand(std::vector<uint8_t> data)
 {
   xSemaphoreTake(bleMutex, portMAX_DELAY);
   bool sent = true;
+  unsigned long send_start = millis();
   int mtu_size = 509;
   for (size_t i = 0; i < data.size(); i += mtu_size)
   {
@@ -156,7 +157,7 @@ bool sendCommand(std::vector<uint8_t> data)
   }
   xSemaphoreGive(bleMutex);
 
-  Serial.printf("Sent %d bytes: %s\n", data.size(), sent ? "ok" : "not connected");
+  Serial.printf("Sent %d bytes in %lu ms: %s\n", data.size(), millis() - send_start, sent ? "ok" : "not connected");
   return sent;
 }
 
@@ -226,6 +227,9 @@ bool connectToserver(BLEAddress pAddress)
     Serial.println("Connect failed");
     return false;
   }
+  // the default of 23 bytes makes a 3 KB image take almost 6 seconds
+  pClient->setMTU(517);
+  Serial.printf(" - MTU: %d\n", pClient->getMTU());
   Serial.print(" - Connected to BT device: ");
   Serial.println(pClient->getPeerAddress().toString().c_str());
 

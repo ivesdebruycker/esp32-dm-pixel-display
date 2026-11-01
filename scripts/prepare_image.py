@@ -7,7 +7,7 @@ from PIL import Image, ImageOps
 
 SIZE = (32, 32)
 # Keep in sync with max_png_size in the firmware
-MAX_BYTES = 2923
+MAX_BYTES = 3663
 
 
 def encode(image):

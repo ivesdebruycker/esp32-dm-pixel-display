@@ -84,13 +84,15 @@ Only `/update` needs a password, so keep the board off untrusted networks.
 
 ## Web UI
 
-A page to upload images, with automatic resizing and a preview, and to control the display. It runs in Docker and passes requests on to the board.
+A page to upload images, with automatic resizing and a preview, to keep an image library and playlists, and to control the display. It runs in Docker and passes requests on to the board.
+
+Playlists have a duration per image (at least 5 seconds) and aren't limited to the board's 10 slots, because the server sends images one at a time and keeps the library in a Docker volume. They resume when the container restarts. When the server is off, the last image stays on screen until the board is told otherwise.
 
 ```bash
 PIXEL_DISPLAY_HOST=192.168.1.60 docker compose up -d --build
 ```
 
-Open port 8032 on that machine, set `WEB_PORT` to use another one. It has no login, so only run it on a network you trust. It restarts along with Docker, `docker compose down` removes it.
+Open port 8032 on that machine, set `WEB_PORT` to use another one. It has no login, so only run it on a network you trust. It restarts along with Docker. `docker compose down` removes the container and keeps the library, `docker compose down -v` also deletes the library and playlists.
 
 ## Preparing images
 

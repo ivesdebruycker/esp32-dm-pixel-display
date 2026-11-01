@@ -7,5 +7,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY web/app.py scripts/prepare_image.py ./
 COPY web/static ./static
 
+RUN mkdir /data && chown nobody /data
 USER nobody
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

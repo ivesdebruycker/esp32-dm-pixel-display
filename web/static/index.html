@@ -33,14 +33,14 @@
   #details { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; margin: 0; }
   #details dt { color: var(--muted); font-size: .85rem; }
   #details dd { margin: 0; font-weight: 600; overflow-wrap: anywhere; }
-  #drop {
+  .dropzone {
     display: block; border: 2px dashed var(--line); border-radius: 10px; padding: 28px 16px;
-    text-align: center; cursor: pointer;
+    text-align: center; cursor: pointer; position: relative;
   }
-  #drop.over, #drop:hover { border-color: var(--accent); }
-  #drop:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
-  #drop small { display: block; color: var(--muted); margin-top: 4px; }
-  #file { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .dropzone.over, .dropzone:hover { border-color: var(--accent); }
+  .dropzone:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .dropzone small { display: block; color: var(--muted); margin-top: 4px; }
+  .dropzone input { position: absolute; opacity: 0; width: 1px; height: 1px; }
   #result[hidden] { display: none; }
   #result { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 16px; align-items: flex-start; }
   #preview {
@@ -65,6 +65,37 @@
   #message.error { color: var(--bad); }
   #message.busy { color: var(--muted); }
   .spacer { flex: 1 1 auto; }
+  .muted { color: var(--muted); margin: 0 0 12px; }
+  .field { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
+  select, input[type="number"] {
+    font: inherit; color: var(--text); background: var(--panel); min-height: 42px;
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; max-width: 100%;
+  }
+  select { min-width: 140px; max-width: 220px; }
+  input[type="number"] { width: 92px; }
+  #now-playing.active { color: var(--good); font-weight: 600; }
+  #now-playing.waiting { color: var(--warn); font-weight: 600; }
+  ol, ul { list-style: none; margin: 12px 0; padding: 0; }
+  ol:empty, ul:empty { display: none; }
+  #playlist-items li {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    padding: 8px 0; border-top: 1px solid var(--line);
+  }
+  #playlist-items li.current { box-shadow: inset 3px 0 0 var(--accent); padding-left: 10px; }
+  .item-select {
+    display: flex; align-items: center; gap: 10px; flex: 1 1 160px; min-width: 0;
+    text-align: left; font-weight: 400; padding: 4px; border-color: transparent;
+  }
+  .item-select:disabled { opacity: 1; }
+  .thumb { width: 48px; height: 48px; image-rendering: pixelated; background: #000; border-radius: 4px; flex: none; }
+  .name { flex: 1 1 120px; min-width: 0; overflow-wrap: anywhere; }
+  .duration { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+  .icon { min-width: 42px; padding: 9px 10px; }
+  #library { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  #library li { border: 1px solid var(--line); border-radius: 8px; padding: 10px; display: grid; gap: 8px; align-content: start; }
+  #library .thumb { width: 96px; height: 96px; }
+  #library .card-actions { display: grid; gap: 6px; }
+  #library .name { font-weight: 600; flex: none; }
 </style>
 </head>
 <body>
@@ -87,7 +118,7 @@
 
   <section class="panel" aria-labelledby="image-title">
     <h2 id="image-title">Image</h2>
-    <label id="drop">
+    <label id="drop" class="dropzone">
       <input id="file" type="file" accept="image/*">
       <strong>Drop an image here or choose a file</strong>
       <small>It's cropped to a centred square and resized to 32×32 automatically</small>
@@ -98,10 +129,40 @@
         <p id="summary"></p>
         <div class="actions">
           <button id="show" class="primary" type="button">Show now</button>
+          <button id="add-library" type="button">Add to library</button>
           <button id="save" type="button">Save to board</button>
         </div>
       </div>
     </div>
+  </section>
+
+  <section class="panel" aria-labelledby="playlist-title">
+    <h2 id="playlist-title">Playlists</h2>
+    <p id="now-playing" class="muted">No playlist playing</p>
+    <div class="actions">
+      <label class="field">Playlist
+        <select id="playlist-select"></select>
+      </label>
+      <button id="play" class="primary" type="button">Play</button>
+      <button id="stop-playlist" type="button">Stop</button>
+      <span class="spacer"></span>
+      <button id="new-playlist" type="button">New</button>
+      <button id="rename-playlist" type="button">Rename</button>
+      <button id="delete-playlist" class="danger" type="button">Delete</button>
+    </div>
+    <ol id="playlist-items"></ol>
+    <p id="playlist-empty" class="muted">Add images to this playlist from the library below.</p>
+  </section>
+
+  <section class="panel" aria-labelledby="library-title">
+    <h2 id="library-title">Library</h2>
+    <label id="library-drop" class="dropzone">
+      <input id="library-files" type="file" accept="image/*" multiple>
+      <strong>Drop images here to add them to the library</strong>
+      <small>Or choose several files. Each one is resized to 32×32 automatically</small>
+    </label>
+    <p id="library-empty" class="muted">No images yet.</p>
+    <ul id="library"></ul>
   </section>
 
   <section class="panel" aria-labelledby="control-title">
@@ -121,8 +182,14 @@
 <script>
 const $ = id => document.getElementById(id);
 let converted = null;
+let sourceFile = null;
 let previewUrl = null;
 let busy = false;
+let library = [];
+let playlists = [];
+let selectedPlaylistId = null;
+let currentPlayer = null;
+let limits = { min_duration: 5, max_duration: 86400, default_duration: 15 };
 
 function setMessage(text, kind = "") {
   $("message").textContent = text;
@@ -154,8 +221,28 @@ async function run(label, action) {
     setMessage(offline ? "Could not reach the web UI server" : error.message, "error");
   } finally {
     setBusy(false);
+    updatePlaylistButtons();
+    // setBusy enables every button, these restore the ones that should stay disabled
+    renderPlaylistItems();
+    renderLibrary();
     refreshStatus();
   }
+}
+
+async function sendJson(url, method, body) {
+  const response = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(await errorText(response));
+  return response.status === 204 ? null : response.json();
+}
+
+async function requestWithMethod(url, method) {
+  const response = await fetch(url, { method });
+  if (!response.ok) throw new Error(await errorText(response));
+  return response;
 }
 
 async function post(url, body) {
@@ -170,6 +257,7 @@ function formatBytes(bytes) {
 
 function handleFile(file) {
   if (!file) return;
+  sourceFile = file;
   run(`Converting ${file.name}…`, async () => {
     const form = new FormData();
     form.append("file", file);
@@ -240,22 +328,255 @@ async function refreshStatus() {
   const mode = online ? board.mode : null;
   $("slideshow-start").setAttribute("aria-pressed", mode === "slideshow");
   $("clock").setAttribute("aria-pressed", mode === "clock");
+
+  if (status) showPlayer(status.player);
+}
+
+function showPlayer(state) {
+  currentPlayer = state;
+  const text = $("now-playing");
+  if (!state.active) {
+    text.textContent = state.message || "No playlist playing";
+    text.className = "muted";
+  } else if (state.state === "waiting") {
+    text.textContent = `${state.playlist_name}: waiting, retrying soon. ${state.message}`;
+    text.className = "muted waiting";
+  } else {
+    const left = state.seconds_left === null ? "" : `, next in ${formatDuration(state.seconds_left)}`;
+    const image = state.image_name ? `${state.image_name} (${state.position} of ${state.count})` : "starting";
+    text.textContent = `Playing ${state.playlist_name}: ${image}${left}`;
+    text.className = "muted active";
+  }
+  markCurrentItem();
+}
+
+function formatDuration(seconds) {
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  return seconds % 60 ? `${minutes} min ${seconds % 60} s` : `${minutes} min`;
+}
+
+function selectedPlaylist() {
+  return playlists.find(playlist => playlist.id === selectedPlaylistId) || null;
+}
+
+function button(label, onClick, className = "") {
+  const element = document.createElement("button");
+  element.type = "button";
+  element.textContent = label;
+  element.className = className;
+  element.disabled = busy;
+  element.addEventListener("click", onClick);
+  return element;
+}
+
+function thumbnail(image, alt) {
+  const element = document.createElement("img");
+  element.className = "thumb";
+  element.src = image.url;
+  element.alt = alt;
+  element.loading = "lazy";
+  return element;
+}
+
+function renderPlaylistSelect() {
+  const select = $("playlist-select");
+  select.replaceChildren(...playlists.map(playlist => {
+    const option = document.createElement("option");
+    option.value = playlist.id;
+    option.textContent = playlist.name;
+    return option;
+  }));
+  if (!selectedPlaylist()) selectedPlaylistId = playlists.length ? playlists[0].id : null;
+  if (selectedPlaylistId !== null) select.value = selectedPlaylistId;
+  updatePlaylistButtons();
+}
+
+function updatePlaylistButtons() {
+  const playlist = selectedPlaylist();
+  $("playlist-select").disabled = busy || !playlist;
+  $("play").disabled = busy || !playlist || playlist.items.length === 0;
+  $("rename-playlist").disabled = busy || !playlist;
+  $("delete-playlist").disabled = busy || !playlist;
+}
+
+function markCurrentItem() {
+  const playing = currentPlayer && currentPlayer.active && currentPlayer.playlist_id === selectedPlaylistId;
+  [...$("playlist-items").children].forEach((row, index) => {
+    const current = Boolean(playing && currentPlayer.position === index + 1);
+    row.classList.toggle("current", current);
+    const select = row.querySelector(".item-select");
+    select.disabled = busy || !playing;
+    select.title = playing ? "Skip to this image" : "";
+    if (current) select.setAttribute("aria-current", "true");
+    else select.removeAttribute("aria-current");
+  });
+}
+
+function renderPlaylistItems() {
+  const playlist = selectedPlaylist();
+  const items = playlist ? playlist.items : [];
+  $("playlist-empty").hidden = !playlist || items.length > 0;
+  $("playlist-items").replaceChildren(...items.map((item, index) => {
+    const image = library.find(entry => entry.id === item.image_id);
+    const row = document.createElement("li");
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = image ? image.name : "Unknown image";
+
+    const select = button("", () => run(`Skipping to ${name.textContent}…`, async () => {
+      const result = await sendJson("/api/player/skip", "POST", { playlist_id: playlist.id, position: index });
+      return result.message;
+    }), "item-select");
+    if (image) select.append(thumbnail(image, ""));
+    select.append(name);
+    row.append(select);
+
+    const label = document.createElement("label");
+    label.className = "duration";
+    const duration = document.createElement("input");
+    duration.type = "number";
+    duration.min = limits.min_duration;
+    duration.max = limits.max_duration;
+    duration.value = item.duration;
+    duration.setAttribute("aria-label", `Seconds to show ${name.textContent}`);
+    duration.addEventListener("change", () => {
+      const seconds = Number(duration.value);
+      if (!Number.isInteger(seconds) || seconds < limits.min_duration || seconds > limits.max_duration) {
+        setMessage(`Duration must be ${limits.min_duration} to ${limits.max_duration} seconds`, "error");
+        duration.value = item.duration;
+        return;
+      }
+      changeItems(items.map((other, position) => position === index ? { ...other, duration: seconds } : other));
+    });
+    label.append(duration, "s");
+    row.append(label);
+
+    row.append(
+      button("↑", () => moveItem(index, -1), "icon"),
+      button("↓", () => moveItem(index, 1), "icon"),
+      button("Remove", () => changeItems(items.filter((_, position) => position !== index))),
+    );
+    row.children[row.children.length - 3].setAttribute("aria-label", `Move ${name.textContent} up`);
+    row.children[row.children.length - 2].setAttribute("aria-label", `Move ${name.textContent} down`);
+    row.children[row.children.length - 3].disabled = busy || index === 0;
+    row.children[row.children.length - 2].disabled = busy || index === items.length - 1;
+    return row;
+  }));
+  markCurrentItem();
+}
+
+function moveItem(index, offset) {
+  const items = [...selectedPlaylist().items];
+  const [item] = items.splice(index, 1);
+  items.splice(index + offset, 0, item);
+  changeItems(items);
+}
+
+function changeItems(items) {
+  const playlist = selectedPlaylist();
+  run("Saving the playlist…", async () => {
+    await sendJson(`/api/playlists/${playlist.id}`, "PUT", { name: playlist.name, items });
+    await loadData();
+    return "Playlist saved";
+  });
+}
+
+function renderLibrary() {
+  $("library-empty").hidden = library.length > 0;
+  $("library").replaceChildren(...library.map(image => {
+    const card = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = image.name;
+
+    const actions = document.createElement("div");
+    actions.className = "card-actions";
+    const add = button("Add to playlist", () => {
+      const playlist = selectedPlaylist();
+      changeItems([...playlist.items, { image_id: image.id, duration: limits.default_duration }]);
+    });
+    add.disabled = busy || !selectedPlaylist();
+    actions.append(
+      button("Show now", () => run(`Showing ${image.name}…`, async () => {
+        const response = await requestWithMethod(`/api/library/${image.id}/show`, "POST");
+        return (await response.json()).message;
+      })),
+      add,
+      button("Delete", () => {
+        const usage = image.used_in ? ` It's used in ${image.used_in} playlist(s) and will be removed from them.` : "";
+        if (!confirm(`Delete ${image.name}?${usage} This can't be undone.`)) return;
+        run(`Deleting ${image.name}…`, async () => {
+          await requestWithMethod(`/api/library/${image.id}`, "DELETE");
+          await loadData();
+          return "Image deleted";
+        });
+      }, "danger"),
+    );
+    card.append(thumbnail(image, ""), name, actions);
+    return card;
+  }));
+}
+
+async function loadData() {
+  const [libraryResponse, playlistResponse] = await Promise.all([fetch("/api/library"), fetch("/api/playlists")]);
+  if (!libraryResponse.ok || !playlistResponse.ok) throw new Error("Could not load the library and playlists");
+  library = await libraryResponse.json();
+  playlists = await playlistResponse.json();
+  renderPlaylistSelect();
+  renderPlaylistItems();
+  renderLibrary();
 }
 
 $("file").addEventListener("change", event => {
   handleFile(event.target.files[0]);
   event.target.value = "";
 });
-const drop = $("drop");
-["dragenter", "dragover"].forEach(name => drop.addEventListener(name, event => {
-  event.preventDefault();
-  drop.classList.add("over");
-}));
-["dragleave", "drop"].forEach(name => drop.addEventListener(name, event => {
-  event.preventDefault();
-  drop.classList.remove("over");
-}));
-drop.addEventListener("drop", event => handleFile(event.dataTransfer.files[0]));
+function setUpDropzone(zone, onFiles) {
+  ["dragenter", "dragover"].forEach(name => zone.addEventListener(name, event => {
+    event.preventDefault();
+    zone.classList.add("over");
+  }));
+  ["dragleave", "drop"].forEach(name => zone.addEventListener(name, event => {
+    event.preventDefault();
+    zone.classList.remove("over");
+  }));
+  zone.addEventListener("drop", event => onFiles(event.dataTransfer.files));
+}
+setUpDropzone($("drop"), files => handleFile(files[0]));
+setUpDropzone($("library-drop"), addFilesToLibrary);
+
+$("library-files").addEventListener("change", event => {
+  // the list empties when the input is reset, so keep a copy
+  addFilesToLibrary([...event.target.files]);
+  event.target.value = "";
+});
+
+function addFilesToLibrary(fileList) {
+  const files = [...fileList];
+  if (!files.length) return;
+  run(`Adding ${files.length} image(s) to the library…`, async () => {
+    const failed = [];
+    for (const [index, file] of files.entries()) {
+      setMessage(`Adding ${file.name} (${index + 1} of ${files.length})…`, "busy");
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        await post("/api/library", form);
+      } catch (error) {
+        failed.push(`${file.name}: ${error instanceof TypeError ? "upload failed" : error.message}`);
+      }
+    }
+    await loadData();
+
+    const added = files.length - failed.length;
+    if (failed.length) {
+      throw new Error(`Added ${added} of ${files.length}. Not added: ${failed.join("; ")}`);
+    }
+    return `Added ${added} image(s) to the library`;
+  });
+}
 
 $("show").addEventListener("click", () => sendConverted("/api/show", "Sending to the display…"));
 $("save").addEventListener("click", () => sendConverted("/api/save", "Saving to the board…"));
@@ -268,8 +589,76 @@ $("clear").addEventListener("click", () => {
   }
 });
 
-refreshStatus();
-setInterval(refreshStatus, 5000);
+$("add-library").addEventListener("click", () => {
+  if (!sourceFile) return;
+  run(`Adding ${sourceFile.name} to the library…`, async () => {
+    const form = new FormData();
+    form.append("file", sourceFile);
+    await post("/api/library", form);
+    await loadData();
+    return "Added to the library";
+  });
+});
+$("playlist-select").addEventListener("change", event => {
+  selectedPlaylistId = Number(event.target.value);
+  renderPlaylistItems();
+  renderLibrary();
+  updatePlaylistButtons();
+});
+$("new-playlist").addEventListener("click", () => {
+  const name = prompt("Playlist name");
+  if (!name || !name.trim()) return;
+  run("Creating the playlist…", async () => {
+    const playlist = await sendJson("/api/playlists", "POST", { name: name.trim() });
+    selectedPlaylistId = playlist.id;
+    await loadData();
+    return "Playlist created";
+  });
+});
+$("rename-playlist").addEventListener("click", () => {
+  const playlist = selectedPlaylist();
+  const name = prompt("New playlist name", playlist.name);
+  if (!name || !name.trim()) return;
+  run("Renaming the playlist…", async () => {
+    await sendJson(`/api/playlists/${playlist.id}`, "PUT", { name: name.trim(), items: playlist.items });
+    await loadData();
+    return "Playlist renamed";
+  });
+});
+$("delete-playlist").addEventListener("click", () => {
+  const playlist = selectedPlaylist();
+  if (!confirm(`Delete the playlist ${playlist.name}? Its images stay in the library.`)) return;
+  run("Deleting the playlist…", async () => {
+    await requestWithMethod(`/api/playlists/${playlist.id}`, "DELETE");
+    selectedPlaylistId = null;
+    await loadData();
+    return "Playlist deleted";
+  });
+});
+$("play").addEventListener("click", () => {
+  const playlist = selectedPlaylist();
+  run(`Starting ${playlist.name}…`, async () => {
+    const response = await requestWithMethod(`/api/playlists/${playlist.id}/play`, "POST");
+    return (await response.json()).message;
+  });
+});
+$("stop-playlist").addEventListener("click", () => run("Stopping the playlist…", async () => {
+  const response = await requestWithMethod("/api/player/stop", "POST");
+  return (await response.json()).message;
+}));
+
+async function start() {
+  try {
+    const response = await fetch("/api/limits");
+    if (response.ok) limits = await response.json();
+    await loadData();
+  } catch {
+    setMessage("Could not load the library and playlists", "error");
+  }
+  refreshStatus();
+  setInterval(refreshStatus, 5000);
+}
+start();
 </script>
 </body>
 </html>

@@ -36,14 +36,20 @@
 #include <BLEAdvertisedDevice.h>
 #include <ErriezCRC32.h>
 #include <WebServer.h>
+#include <ESPmDNS.h>
+#include <LittleFS.h>
+#include <Update.h>
 #include "Commands.h"
+#include "secrets.h"
 
 static Commands commands;
 
-const char *ssid = "***";
-const char *password = "***";
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
+const char *hostname = "pixel-display";
+const char *displayAddress = "9F:C9:66:73:FF:7C";
 
-int scanTime = 5; // In seconds
+int scanTime = 3; // In seconds
 BLEScan *pBLEScan;
 static BLEUUID serviceUUID("00010001-574f-4f20-5370-6865726f2121");
 static BLEAddress *Server_BLE_Address;
@@ -55,13 +61,40 @@ static BLEUUID writeServiceUUID("000000fa-0000-1000-8000-00805f9b34fb");
 static BLEUUID readServiceUUID("0000fa03-0000-1000-8000-00805f9b34fb");
 static BLEUUID writeCharUUID("0000fa02-0000-1000-8000-00805f9b34fb");
 
-// Vector to store the uploaded PNG data
-std::vector<std::vector<uint8_t>> uploaded_files;
-int current_upload_file = 0;
+// Images are kept in LittleFS as /img<slot>.png, the oldest slot gets replaced first
+const int max_files = 10;
+// Largest size seen working, the display acknowledges but ignores a 3012 byte PNG
+const size_t max_png_size = 2923;
+int next_upload_slot = 0;
 int current_display_file = 0;
-int max_files = 10;
 
-unsigned long last_display_change = 0;
+enum DisplayMode
+{
+  MODE_IDLE = 0,
+  MODE_SLIDESHOW = 1,
+  MODE_CLOCK = 2
+};
+static volatile DisplayMode display_mode = MODE_SLIDESHOW;
+
+static volatile unsigned long last_display_change = 0;
+
+// Set from the BLE task, read from the main loop
+static volatile bool paired = false;
+static volatile bool restore_display = false;
+// Entering draw mode blanks the screen, so only do it when the display isn't in it yet
+static volatile bool draw_mode_active = false;
+static SemaphoreHandle_t bleMutex;
+static BLEClient *pClient = nullptr;
+
+class DisplayClientCallbacks : public BLEClientCallbacks
+{
+  void onConnect(BLEClient *client) {}
+  void onDisconnect(BLEClient *client)
+  {
+    paired = false;
+    Serial.println("Display disconnected");
+  }
+};
 
 int seq = 0;
 std::string generateCommand(char DID, char CID, char SEQ, char DLEN, ...)
@@ -101,31 +134,29 @@ std::string generateCommand(char DID, char CID, char SEQ, char DLEN, ...)
   // return readSimplePacket();
 }
 
-void sendCommand(std::vector<uint8_t> data)
+bool sendCommand(std::vector<uint8_t> data)
 {
+  xSemaphoreTake(bleMutex, portMAX_DELAY);
+  bool sent = true;
   int mtu_size = 509;
   for (size_t i = 0; i < data.size(); i += mtu_size)
   {
-    // Print chunk index
-    printf("Sending chunk %d\n", i / mtu_size);
+    if (!paired || writeCharacteristic == nullptr)
+    {
+      sent = false;
+      break;
+    }
+
     // create chunk
     std::vector<uint8_t> chunk(data.begin() + i, data.begin() + std::min(i + mtu_size, data.size()));
 
     // write to GATT characteristic
     writeCharacteristic->writeValue(chunk.data(), chunk.size(), true);
-
-    // Write to GATT characteristic
-    // std::vector<uint8_t> chunk(data.begin() + i, data.begin() + std::min(i + mtu_size, data.size()));
-    // write_gatt_char(uuid_write_data, chunk, response);
   }
+  xSemaphoreGive(bleMutex);
 
-  // print the data
-  for (uint8_t byte : data)
-  {
-    Serial.print(byte, HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
+  Serial.printf("Sent %d bytes: %s\n", data.size(), sent ? "ok" : "not connected");
+  return sent;
 }
 
 class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
@@ -145,12 +176,12 @@ static void notifyCallback(
     size_t length,
     bool isNotify)
 {
-  Serial.print("Notify callback for characteristic ");
-  Serial.print(pBLERemoteCharacteristic->getUUID().toString().c_str());
-  Serial.print(" of data length ");
-  Serial.println(length);
-  Serial.print("data: ");
-  Serial.println((char *)pData);
+  Serial.printf("Notify at %lu ms:", millis());
+  for (size_t i = 0; i < length; i++)
+  {
+    Serial.printf(" %02X", pData[i]);
+  }
+  Serial.println();
 }
 
 void printVector(const std::vector<uint8_t> &vec)
@@ -181,11 +212,19 @@ void printArray(const uint8_t *arr, size_t size)
 
 bool connectToserver(BLEAddress pAddress)
 {
-  BLEClient *pClient = BLEDevice::createClient();
-  Serial.println(" - Created client");
+  if (pClient == nullptr)
+  {
+    pClient = BLEDevice::createClient();
+    pClient->setClientCallbacks(new DisplayClientCallbacks());
+    Serial.println(" - Created client");
+  }
 
   // Connect to the BLE Server.
-  pClient->connect(pAddress);
+  if (!pClient->connect(pAddress))
+  {
+    Serial.println("Connect failed");
+    return false;
+  }
   Serial.print(" - Connected to BT device: ");
   Serial.println(pClient->getPeerAddress().toString().c_str());
 
@@ -230,6 +269,11 @@ bool connectToserver(BLEAddress pAddress)
     if (writeCharacteristic->canWrite())
     {
       Serial.println(" -- Writeable");
+    }
+    BLERemoteCharacteristic *notifyCharacteristic = writeService->getCharacteristic(readServiceUUID);
+    if (notifyCharacteristic != nullptr && notifyCharacteristic->canNotify())
+    {
+      notifyCharacteristic->registerForNotify(notifyCallback);
     }
     return true;
   }
@@ -526,8 +570,6 @@ createPayloads(const std::vector<uint8_t> &gif_data)
 
 // 69 00    01 00 00    69 00 00 00      71 8F D0 4C      05 00 0D
 
-boolean paired = false;
-
 std::string i0 = "92000000009100000089504e470d0a1a0a0000000d4948445200000020000000200806000000737a7af40000005849444154789cedd7310ec0200c43d1efdeffce66ea52b1112542b52fc0032259116000db744612004feba99bc8dd57ff64fc05020820800002b817a0b74fa700b65d8138fa828a2abf7706020820800002a88af8fb76bc000d111438934a728d0000000049454e44ae426082";
 std::string i1 = "1010010000b9180000db42cb1405000d47494638396120002000f7ff00fedb96aa7353a97254fea800b269402b2b2b3b3a3a010101ffb68bb26a413c3a3afea800aa5b2f2b2b2b3b3939010101a972543c3a3aa97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a9254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a9754a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a9724a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a9725a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a9725497254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a97254a9725456555400000021ff0b4e45545343415045322e3003000000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa042ab466d18b3997067590f323c7a50efcf9638a952acf952c312ed5a75eacfa64925221c4bd6ec54921a7b622debd627d596719576fd595768cbb55d0720e84bf520d18a76831a303060c06203669f563c4c31f1e2c682971af0299922e09f0610606e0c7971618333af2ec59c00f3e0cda1bfa616bb7a0081c6b70714783c1429c203c0830b1f7e0061cc850e0e183830803966e6ca9573ac785c6172c6cd0730d0e7cb981e99e0f1639709e5d7bf9e6051002580f0001fbf6efddbf9f4fbfbefdfbf1edcb5fbf1f3efdfef805e85f7d00b257a08008ced79f7c03e427e081090e08000021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffaf3075468cda217732e652a14e7478e3e0b4ca59ad569d29a587f3a58dab4ab83a148252234fb33a859921a7bb22d2b5668cbb81f7dd66dabd7edd9966bcd0e18e0d7afce9945fbea1dacd827d48a442b361cc78ef638a81c552a6bcf7b0c8be94196c36ccf32a46d003448fd68b56e2cc830762cb9e4dfb00c2980b1d1cd03de04068df070cece65811b742dd0e06fb56ed7b807007c4311f2cd0bcf760d1d50f144008a03b0004debf8729071fbe3b79f3e5d3abf77e7ebdfaf6f0df8f774f1f7dfdf4f1d9cbd77f7ffd80fee5e5675f80f379070021ff0be45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d39fcf020e1cd8fc58d1a2c29d2e3ffaf4075468cda21773fe6c9af323c7a0014682dd0d401559e2b5962c4ea606bd7af492522c4aa5501d7a05e8392d458136e56b376e1d26440f7a3ddb66fc9ca6db956f0000467f51e245a31af020303061898dc156a45c614ed4e8e7c18ab81a0962916f66a0001e7c8060a4c16ba58ac46bb9c097046bc7a28d29957b19e66c059f564db12671e3c40bcb8f1e30710c65ce8e08081030307386eedc39c78acb1536871c5d366fe9cf0d5c3d177db080f4e89c199c3f50002180f70010c08f3f5ffefcfbefede3dfcf1fbefefef4f9575f7e001668207fff0d58e0000a1e28e0830ede97608404c2070021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c183050528148602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d39fbf02051c38b0f9b1a245853b5d7e140a5428d199462fe6641a7428ce8f1c990a75d054eb509e2b5962f4cab52a57a760252224dbf5acd5831a6b6e35dbd62c4d067197b2a5bbf5ee5aaf0306f0757a068c5b95b03fb74eb206a45c314113b08acf8e756c714ff9ea54cd932618333b332a5cc80b3ddb46235ce0d5cda745fb0080fc89e4dbbf6018431173a38b07bc001d2bf0f18e0cdb1626e85bb27fb1ed0faf780e10e8a673e58c0f972e6d77d174008a03b0004debf8728071fbe3b79f3e5d3abf77e7ebdfaf6f0df8f774f1f7dfdf4f1d9cbd777ffd80fee5b517e07ded010021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa42ab466d18b3997067590f323c7a53e7f4efdd93469cdab5ca5669d3a14a9448458c5a625a9b1675aad63b3d264d056e95ba0fefc85a5da126dda0108f2e6ddaa7366d1b8060c0c182078ebd38a442b8e4dbc18b0de02067c3ea6e8f7a7010495171bc09cb9b0c8b19509544640fa334fab1851576650b9755989330f1ed8cdbbb7ef0308632e770c0c08101c72b1f2f5e9c6345e10a892b46ae9a7672e3069c733e582039f2d9de0f14314008a03c0004e6cfa7479fbe7d79f6eee3cb370f7fbe7afaebdfdbdfcf5f7efdfcfb0d00607ff81548607bff1da89f79000021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c183053280c806021430610190824409140c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa042ab466d18b3997067590f323c7a53e7f4efdd93469cdab5ca5669d3a14a9448458a5faf31796a4c69e697fae5dbb952683b74ae31698ebaf6e4bb469020d8cbb6ee41a215c73a306060c000c606b63ead8898e258c68e052f35e0733245c03f0d20c8ec383263aa8759621c9b9940e6c18b45f3b4ba7a296906990b402e2b71e6c103c0830b1f7e0061cc850e0e183830807966e6ca9573ac785c61f2c6cd5de376bedcc0f4cf070b38376f9e99c1f803051002580f0001fbf6efddbf9fbf5e3efdfbf89dbcf0f5f7ffcfaf9edc7df8004fa37e000ff15982080030a68a08203020021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811cac59d3818302057cdafc58d1a2c29d2e3ffa042ab466d18b3997067590f323c7a53e7f16f0e7ef67d3a435af7a5dca95ebd4a1482522c44ab6ec59841a7bb2d5ca752cd5967195ce653a97a65a8359a70e1830d5aece994503671dacd8e7d38a442b361eccd8ee638a6bb152a66cf8e04cb13f2933d85c18adc4b018030f1e4d3aabe9a1080fc8e4dbbf601b81a1d3a38b07bc001ca047e1f30c09b63c5980b773b18fc9bf5ef01c41d18c77cb0c073dfabb1332f801080770008be8329171f5ebcf7f2e7cdab5fff1d3dfbf5eee3c327ffbe7e7afbeae5b79fbf1f3ffb01fe99e79e80f8b9070021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708f0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa04eacfdfd099452fe65cdad429ce8f1c97fafc59d55f50074f25ae9c99f5e756a6fecc82e53913a1d6a55fd592d4d8f3edcfb816932a0abd42ed0b35bf5ba7d3b6000dec007895604ecb3306307512b2aa678b66961c76a21870c7970abe5cb8ef3266689d1f36506a0f3b2255b7a6961d4a903b34578a0b6eddbb80f208cb9d0c101df030e9c167ec0c06f8e15792bf4eda0b070d8c2071877809c22c202d183bfd6eebc004200e001202c082f9efc78f2e0cfa747cfbe7d78feedbc39f2fdf7cfcfbebf1b3a7ffbe7e7ffdee0d00207af011a81f7c000021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811cec59d3808102fe82dafc58d1a2c29d2e3ffa042ab466d18b399732cdf991a30307057cfeccbaf4ea50a435ad627520556b01af3c6722bcca75ab59af0835d6bc8ad56cdbb35e5bcafd48f7ee5dba34251eec1b740002bc3f011f245a916ed0c203de5e7d5a913145c7900d93cd3a3964c8c16cfd2118409af44f9f0e74b2c4d8b77482d287b57e91896355bd20470936e3b7b28c203c0830b1f7e20ae46870e0e183830807969e6ca9573ac1873617203a4993318c0c0f97203d329223b2ce0bc39e9ede50f144008a03d0004eedfc7871fbf7e7bfaf6f3ebdfaf1fbf7cf7fe01c8df80f505385f7f042638a07ff40d702081062a785f7c000021ff0b4e45545343415045322e30030100000021f94093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d381830205fcf9b3f9b1a245853b5d7ef409d427d199462fe6645ac029ce8f1c99fafc5955ab83a71257ceccfa736b53af69f92f4cad5acd5831a7b3215da962d4d067197fa142af46c59a72d116ee53b6040d7bf5f0f16ad68966e61b73ea356";
 std::string i2 = "c908010002b9180000db42cb1405000d5c4c1172e1c788255314acf5f265c43a5962347b9981e7c3696b92fd59d8f4e9ada9251e3c40bbb6eddb0710c65ce8e040ef01074a073f60c037c78abb15f6765038b8ebe0038a3b38bef96001e8c05b676f5e002180ef0010802a0f3f5efcf8efe6d19f5fcf1e7cfaf6ecdfcb8f5f1ebe7df5f7d7cf774f9f7ffef603fc77de7b03e6f71e0021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa042ab466d18b3997067590f323c7a53e7f4efdd93469cdab3ffdf9d39a75ea50a41211fa142b962956aa0835f65ccbd62d57a12de52a5d2a96ec5baa2dd5be1d8060eb569d338b967560c0c080018d0d6c7d5a9168c5b28d1f135e6ac027658a827f1a40a0f9b1e4c6700dce04fb533301cd85198fe6691563d9d20c3417887c56e2cc8307820b1f4efc405c8d0e1d1c3070604073cdcd972fe75831e642e58e9dbfcefd9cb901eaa00f163878ee5c3303f2070a2004c01e0082f6eee1bf874f9ffdfcfaf8f3b7bfaf3ffe7ef9f6e9c75f7f0416f81f81030068a082011238e0810b12080021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa042ab466d18b39fdfd0cea20e7478e3efd69f5c77469d3a435b13ad8ca95eacfaf4825225caa75aacfb355116aece975a959b33419cc555ad76ddfbc6beb0e4070f7adce9945df06356060c000c606cc3ead48b4a262c68e072f35e07332c5c03f0d20c8ec3832e3b806678afd99394166c2a787a6658951b16302b71d17802c5be2cc8307820b1f4efc805c8d0e1d1c30706040f3cccd972fe75831e642e58d9d0f60b0fd397303d43f1f372cf05cfb76f3ce0b2004c01e0082f6eee1bf874fbfbefdfbf8e5df9fcf9e7ffcfafee527e07f03ea57e07e05fa37df00071ad8a082f0010021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d39f8302051c38b0f9b1a245853b5d7ef4e70fa850a2338d5eccc9d4e9509c1f390a2dc0f467d0ad4f79ae648911ecd6af3fc32a9588d0ac57a169af1ed458132e5aab7187b6a4fbd1aeddbb7069b235e8d7c10004809f1e2c5ad1af010303063c3680566a45c614ed3e8e7c78ab01a19629b6f58c807364ca8fe5169ca9752b67029c113b780c5562cdd63f4d33e05c60726da2080f081f4ebcf8018431173a3860e0c000e79c9d3367ceb1627285cb213f87bd1b7a7303d5451f392c00fd396706e50f144008a03d0004eedfc7871fbf7e7bfaf6f3eb778f7fbf7cfef3ddb75f7ffe15682080050e10e0810b0a582081083258200021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d39fbf02051c38b0f9b1a245853b5d7ef4e700a850a2338d5ecc29d4e9509c1f395615da34e8d6a13c57b2c4f8b52b57af5025de3c58d66ad3a70835d63c7bd6ebdba72de57ea45bd5ae5d9a12d97e1d80c02f579d512bd2f539608081c776a5562caab82ae3c608aa1a102a9922c2b3fe10341e6da0c0e3ab06676aad3a3ac1e8c2a7d3ca5edd74f40006a34d3f963df3e081dfc0830b3f1057a34307070c1c18b07cf4f2e4c939568cb910b981c60708dc66de58b901e99e0f163968cebd3103f2070a2004c01e0082f6eee1bf874f9ffdfcfaf8f3b7bfaf3ffe7ef9f6f527e080f9f107a080031c48e07f0c2e489f810e06d81e0021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3818302057cdafc58d1a2c29d2e3ffa042ab466d18b3997067590f323c7a53e7f4efdd93469cdab5ca5669d3a14a9448458c5a625a9b1675aad63b3d264d05629567ffe98be9d8b7629de0103b66ed539b3e858bcfe00c7f5f9b422d18a7113031ef0b631c5be5c274f0e4bf5e04cb03f2733d03c98a7558c63018f262dd734c203b063cb9e7d0061cc850e0ee41e704074ef03067473ac785b616e07807bafee3d20b883e1970f1660ce5b75f5e4051002d80e0001f7eedfbd7f24df2e9efcf8f3e8d3ab1f5f1e3c77f1ede3af9f4f1f7dfbf403c2d767af7ffefdf7fbd5070021ff0b4e45545343415045322e30030100000021f904093200ff002c00000000200020000708ff0011081c48b0a0c1830503280c80602143061019084c403141c38517150a7498f161c489153b8a4448b264c1901c394694a8f2634494185b4214b912c147933811ceac59d3808102057cdafc58d1a2c29d2e3ffa042ab466d18b3997063590f32347070ea6fed45a00eb50a435af66f5b9956c57075f25de3c8835a83f7f4c977a45a8b126d6ac6fdf72bd4b9341dd8f770be4856b966f4b84810df81b80a0abdcb90689564cec73c080c2589f56944c91b265c60e7e1ac81c3224dbb6543f5b163d5a274b8c813f27f8dc986cdadb62b3aa66f059ebed99070f081f4ebcf801ba1a1d3a3860e0c000e79f9d3367ceb162cc85cb0d583e4060006fe8cd0d543da788b000f4e79f199c3f50002180f70010c08f3f5ffefcfbefede3dfcf1fbefefef4f9575f7e001668207fff0d58e0000a1e28e0830ede97608404c207003b";
@@ -611,212 +653,457 @@ void handlePost()
   }
 
   String body = server.arg("plain");
+  if (body.length() == 0 || body.length() % 2 != 0)
+  {
+    server.send(400, "text/plain", "Body must be a hex string");
+    return;
+  }
+
   std::vector<uint8_t> data = hexStringToByteArray(body.c_str());
 
-  if (writeCharacteristic != nullptr && writeCharacteristic->canWrite())
+  // a raw command can change the display's mode
+  draw_mode_active = false;
+  if (sendCommand(data))
   {
-    sendCommand(data);
     server.send(200, "text/plain", "Data sent over Bluetooth");
   }
   else
   {
-    server.send(500, "text/plain", "Bluetooth characteristic not available for writing");
+    server.send(503, "text/plain", "Display not connected");
   }
 }
 
-std::vector<uint8_t> png_data;
-void handlePng()
+String imagePath(int slot)
 {
+  return "/img" + String(slot) + ".png";
+}
 
-  // handle uploaded file
+int countImages()
+{
+  int count = 0;
+  for (int slot = 0; slot < max_files; slot++)
+  {
+    if (LittleFS.exists(imagePath(slot)))
+    {
+      count++;
+    }
+  }
+  return count;
+}
+
+void saveSettings()
+{
+  File file = LittleFS.open("/settings", "w");
+  if (file)
+  {
+    file.write((uint8_t)display_mode);
+    file.write((uint8_t)next_upload_slot);
+    file.close();
+  }
+}
+
+void loadSettings()
+{
+  if (!LittleFS.exists("/settings"))
+  {
+    return;
+  }
+
+  File file = LittleFS.open("/settings", "r");
+  if (file && file.size() == 2)
+  {
+    display_mode = (DisplayMode)file.read();
+    next_upload_slot = file.read() % max_files;
+  }
+  if (file)
+  {
+    file.close();
+  }
+}
+
+void setDisplayMode(DisplayMode mode)
+{
+  display_mode = mode;
+  saveSettings();
+}
+
+std::vector<uint8_t> png_data;
+int upload_status = 0;
+String upload_message;
+
+void handlePngUpload()
+{
+  // handle uploaded file, the response is sent by handlePngDone
   HTTPUpload &upload = server.upload();
   if (upload.status == UPLOAD_FILE_START)
   {
     Serial.printf("Upload file start: %s\n", upload.filename.c_str());
-    if (!upload.filename.endsWith(".png"))
+    png_data.clear();
+    upload_status = upload.filename.endsWith(".png") ? 0 : 400;
+    upload_message = "File must be a PNG";
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE && upload_status == 0)
+  {
+    if (png_data.size() + upload.currentSize > max_png_size)
     {
-      server.send(400, "text/plain", "File must be a PNG");
+      png_data.clear();
+      upload_status = 413;
+      upload_message = "File too large";
       return;
     }
-    png_data.clear();
+    png_data.insert(png_data.end(), upload.buf, upload.buf + upload.currentSize);
   }
-  else if (upload.status == UPLOAD_FILE_WRITE)
-  {
-    Serial.printf("Upload file write: %d bytes\n", upload.currentSize);
-    // png_data.push_back(std::vector<uint8_t>(upload.buf[0], upload.buf[upload.currentSize - 1]));
-    for (size_t i = 0; i < upload.currentSize; ++i)
-    {
-      png_data.push_back(upload.buf[i]);
-      // Serial.print(upload.buf[i], HEX);
-    }
-    // Serial.println();
-
-    // print current size
-    Serial.print("png_data.size(): ");
-    Serial.println(png_data.size());
-  }
-  else if (upload.status == UPLOAD_FILE_END)
+  else if (upload.status == UPLOAD_FILE_END && upload_status == 0)
   {
     Serial.printf("Upload file end: %d bytes\n", png_data.size());
-    server.send(200, "text/plain", "File uploaded");
 
-    if (writeCharacteristic != nullptr && writeCharacteristic->canWrite())
+    const uint8_t png_signature[] = {0x89, 'P', 'N', 'G'};
+    if (png_data.size() < 4 || memcmp(png_data.data(), png_signature, 4) != 0)
     {
-      printf("createPNGPayloads\n");
-      std::vector<uint8_t> payload = createPNGPayloads(png_data);
-
-      // print current upload position current_upload_file
-      Serial.print("Set to position: ");
-      Serial.println(current_upload_file);
-
-      // push data to vector uploaded_files on position current_file
-      uploaded_files.push_back(payload);
-      // uploaded_files[current_upload_file] = payload;
-
-      current_upload_file++;
-
-      // limit the number of files to 10
-      if (current_upload_file > max_files)
-      {
-        current_upload_file = 0;
-      }
-
-      // printf("send data\n");
-      // sendCommand(commands.setDrawMode(1));
-      // sendCommand(payload);
-      server.send(200, "text/plain", "Data sent over Bluetooth");
+      upload_status = 400;
+      upload_message = "File must be a PNG";
+      return;
     }
-    else
+
+    String path = imagePath(next_upload_slot);
+    File file = LittleFS.open(path, "w");
+    size_t written = file ? file.write(png_data.data(), png_data.size()) : 0;
+    if (file)
     {
-      server.send(500, "text/plain", "Bluetooth characteristic not available for writing");
+      file.close();
     }
+    if (written != png_data.size())
+    {
+      LittleFS.remove(path);
+      upload_status = 507;
+      upload_message = "Not enough storage";
+      return;
+    }
+
+    Serial.printf("Stored in slot %d\n", next_upload_slot);
+    current_display_file = next_upload_slot;
+    next_upload_slot = (next_upload_slot + 1) % max_files;
+    display_mode = MODE_SLIDESHOW;
+    saveSettings();
+    last_display_change = 0; // show it right away
+    upload_status = 200;
+    upload_message = "File stored";
   }
+}
 
-  /*
-    if (server.hasArg("file") == false)
-  {
-    server.send(400, "text/plain", "File not received");
-    return;
-  }
-
-
-  // load file from body
-  String body = server.arg("file");
-  std::vector<uint8_t> data(body.length());
-  memcpy(data.data(), body.c_str(), body.length());
-
-
-  */
+void handlePngDone()
+{
+  server.send(upload_status == 0 ? 400 : upload_status, "text/plain", upload_status == 0 ? "No file received" : upload_message);
+  upload_status = 0;
+  png_data.clear();
+  png_data.shrink_to_fit();
 }
 
 void handleStartClock()
 {
-  if (writeCharacteristic != nullptr && writeCharacteristic->canWrite())
+  setDisplayMode(MODE_CLOCK);
+  draw_mode_active = false;
+  if (sendCommand(commands.clock(3, true, true, 100, 100, 180)))
   {
-    sendCommand(commands.clock(3, true, true, 100, 100, 180));
     server.send(200, "text/plain", "Clock started");
   }
   else
   {
-    server.send(500, "text/plain", "Bluetooth characteristic not available for writing");
+    server.send(202, "text/plain", "Display not connected, clock starts on reconnect");
   }
+}
+
+void handleStartSlideshow()
+{
+  setDisplayMode(MODE_SLIDESHOW);
+  last_display_change = 0;
+  server.send(200, "text/plain", "Slideshow started");
+}
+
+void handleStopSlideshow()
+{
+  setDisplayMode(MODE_IDLE);
+  server.send(200, "text/plain", "Slideshow stopped");
+}
+
+void handleClearImages()
+{
+  for (int slot = 0; slot < max_files; slot++)
+  {
+    LittleFS.remove(imagePath(slot));
+  }
+  next_upload_slot = 0;
+  current_display_file = 0;
+  saveSettings();
+  server.send(200, "text/plain", "Images removed");
+}
+
+void handleStatus()
+{
+  const char *modes[] = {"idle", "slideshow", "clock"};
+  String json = "{\"display_connected\":";
+  json += paired ? "true" : "false";
+  json += ",\"mode\":\"";
+  json += modes[display_mode];
+  json += "\",\"images\":";
+  json += countImages();
+  json += ",\"max_images\":";
+  json += max_files;
+  json += ",\"fs_used\":";
+  json += LittleFS.usedBytes();
+  json += ",\"fs_total\":";
+  json += LittleFS.totalBytes();
+  json += ",\"free_heap\":";
+  json += ESP.getFreeHeap();
+  json += ",\"wifi_rssi\":";
+  json += WiFi.RSSI();
+  json += ",\"ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\",\"uptime_s\":";
+  json += millis() / 1000;
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+bool ota_authorized = false;
+
+void handleUpdateUpload()
+{
+  HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    ota_authorized = server.authenticate("admin", OTA_PASSWORD);
+    if (ota_authorized)
+    {
+      Serial.printf("OTA start: %s\n", upload.filename.c_str());
+      Update.begin(UPDATE_SIZE_UNKNOWN);
+    }
+  }
+  else if (!ota_authorized)
+  {
+    return;
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    Update.write(upload.buf, upload.currentSize);
+  }
+  else if (upload.status == UPLOAD_FILE_END)
+  {
+    Update.end(true);
+    Serial.printf("OTA end: %d bytes, %s\n", upload.totalSize, Update.errorString());
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    Update.abort();
+  }
+}
+
+void handleUpdateDone()
+{
+  if (!ota_authorized)
+  {
+    return server.requestAuthentication();
+  }
+
+  ota_authorized = false;
+  if (Update.hasError() || !Update.isFinished())
+  {
+    server.send(500, "text/plain", Update.errorString());
+    return;
+  }
+
+  server.send(200, "text/plain", "Update done, restarting");
+  delay(500);
+  ESP.restart();
 }
 
 void setupWebServer()
 {
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info)
+               { Serial.printf("Wi-Fi disconnected, reason %d\n", info.wifi_sta_disconnected.reason); },
+               ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+  WiFi.setHostname(hostname);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(ssid, password); // Connect to the network
   Serial.print("Connecting to ");
   Serial.print(ssid);
   Serial.println(" ...");
 
-  int i = 0;
-  while (WiFi.status() != WL_CONNECTED)
-  { // Wait for the Wi-Fi to connect
-    delay(1000);
-    Serial.print(++i);
-    Serial.print(' ');
-  }
-
-  Serial.println('\n');
-  Serial.println("Connection established!");
-  Serial.print("IP address:\t");
-  Serial.println(WiFi.localIP());
-
   server.on("/send-raw", HTTP_POST, handlePost);
-  server.on("/send-png", HTTP_POST, []()
-            { server.send(200); }, // Send status 200 (OK) to tell the client we are ready to receive
-            handlePng);
+  server.on("/send-png", HTTP_POST, handlePngDone, handlePngUpload);
   server.on("/start-clock", HTTP_POST, handleStartClock);
+  server.on("/slideshow/start", HTTP_POST, handleStartSlideshow);
+  server.on("/slideshow/stop", HTTP_POST, handleStopSlideshow);
+  server.on("/images/clear", HTTP_POST, handleClearImages);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.begin();
 }
 
-void setup()
+void showNextImage();
+
+// Keeps the display connected and updated, separate from loop() so HTTP stays up in the meantime
+void bleTask(void *parameter)
 {
-  Serial.begin(115200);
-  delay(1000); // give me time to bring up serial monitor
-  Serial.println("ESP32 Test");
-  // pinMode(LED_BUILTIN, OUTPUT);
+  BLEAddress address(displayAddress);
+  BLEScan *scan = BLEDevice::getScan();
+  scan->setActiveScan(false);
+  scan->setInterval(100);
+  scan->setWindow(50); // leave airtime for Wi-Fi
+  int failed_connects = 0;
 
-  Serial.println("Scanning...");
-  BLEDevice::init("");
-
-  /*
-  pBLEScan = BLEDevice::getScan(); //create new scan
-  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
-  pBLEScan->setActiveScan(true); //active scan uses more power, but get results faster
-  pBLEScan->setInterval(100);
-  pBLEScan->setWindow(99);  // less or equal setInterval value
-  */
-
-  setupWebServer();
-}
-
-void loop()
-{
-  if (paired == false)
+  for (;;)
   {
-    Serial.println("Connecting to Server as client");
-    Server_BLE_Address = new BLEAddress("9F:C9:66:73:FF:7C");
-    if (connectToserver(*Server_BLE_Address))
+    if (paired)
     {
+      // put the display back in the right state after it was away
+      if (restore_display)
+      {
+        restore_display = false;
+        draw_mode_active = false;
+        last_display_change = 0;
+        if (display_mode == MODE_CLOCK)
+        {
+          sendCommand(commands.clock(3, true, true, 100, 100, 180));
+        }
+      }
+
+      // change the display every 15 seconds
+      if (display_mode == MODE_SLIDESHOW && (last_display_change == 0 || millis() - last_display_change > 15000))
+      {
+        last_display_change = millis();
+        showNextImage();
+      }
+
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
+    // connecting replaces the remote services, so drop our reference first
+    xSemaphoreTake(bleMutex, portMAX_DELAY);
+    writeCharacteristic = nullptr;
+    xSemaphoreGive(bleMutex);
+
+    // only try to connect when the display is advertising
+    bool found = false;
+    BLEScanResults results = scan->start(scanTime, false);
+    for (int i = 0; i < results.getCount(); i++)
+    {
+      if (results.getDevice(i).getAddress().equals(address))
+      {
+        found = true;
+      }
+    }
+    scan->clearResults();
+
+    if (!found)
+    {
+      Serial.println("Display not found");
+      vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    Serial.println("Connecting to Server as client");
+    if (connectToserver(address))
+    {
+      failed_connects = 0;
+      restore_display = true;
       paired = true;
       Serial.println("Paired");
     }
     else
     {
       Serial.println("Pairing failed");
-      delay(5000);
-    }
-  }
-  else
-  {
-    server.handleClient();
-  }
-
-  // change the display every 15 seconds
-  if (millis() - last_display_change > 15000)
-  {
-    last_display_change = millis();
-
-    if (current_upload_file > 0)
-    {
-      // print current image index
-      Serial.print("current_display_file: ");
-      Serial.println(current_display_file);
-
-      printf("setDrawMode\n");
-      sendCommand(commands.setDrawMode(1));
-      // load file from vector uploaded_files on position current_file
-      sendCommand(uploaded_files[current_display_file]);
-      current_display_file++;
-
-      // limit the number of files to max_files, or the number of files uploaded
-      if (current_display_file > max_files || current_display_file > uploaded_files.size() - 1)
+      // the BLE stack only has a few client registrations, a restart gets them back
+      if (++failed_connects >= 3)
       {
-        current_display_file = 0;
+        ESP.restart();
       }
+      vTaskDelay(pdMS_TO_TICKS(5000));
     }
   }
+}
+
+void showNextImage()
+{
+  for (int i = 0; i < max_files; i++)
+  {
+    int slot = (current_display_file + i) % max_files;
+    if (!LittleFS.exists(imagePath(slot)))
+    {
+      continue;
+    }
+
+    File file = LittleFS.open(imagePath(slot), "r");
+    if (!file)
+    {
+      continue;
+    }
+
+    std::vector<uint8_t> image(file.size());
+    file.read(image.data(), image.size());
+    file.close();
+
+    Serial.print("current_display_file: ");
+    Serial.println(slot);
+    if (!draw_mode_active)
+    {
+      draw_mode_active = sendCommand(commands.setDrawMode(1));
+    }
+    sendCommand(createPNGPayloads(image));
+    current_display_file = (slot + 1) % max_files;
+    return;
+  }
+}
+
+void setup()
+{
+  Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+  Serial.setTxTimeoutMs(0); // don't slow down logging when no USB host is attached
+#endif
+  delay(1000); // give me time to bring up serial monitor
+  Serial.println("ESP32 pixel display");
+
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("LittleFS mount failed");
+  }
+  loadSettings();
+
+  bleMutex = xSemaphoreCreateMutex();
+  BLEDevice::init("");
+
+  setupWebServer();
+
+  xTaskCreate(bleTask, "ble", 8192, nullptr, 1, nullptr);
+}
+
+bool mdns_started = false;
+bool wifi_connected = false;
+
+void loop()
+{
+  server.handleClient();
+
+  if (WiFi.status() == WL_CONNECTED && !wifi_connected)
+  {
+    wifi_connected = true;
+    Serial.print("IP address:\t");
+    Serial.println(WiFi.localIP());
+    if (!mdns_started)
+    {
+      mdns_started = MDNS.begin(hostname);
+      MDNS.addService("http", "tcp", 80);
+    }
+  }
+  else if (WiFi.status() != WL_CONNECTED)
+  {
+    wifi_connected = false;
+  }
+
+  delay(2);
 }
 
 void loopOLD()

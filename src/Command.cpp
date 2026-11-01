@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <vector> // Include the vector header
 #include "Commands.h"
 
@@ -53,7 +54,7 @@ std::vector<uint8_t> Commands::setBrightness(int brightnessPct)
       0,
       4,
       128,
-      brightnessPct % 100,
+      constrain(brightnessPct, 5, 100),
   };
   return std::vector<uint8_t>(brightnessMsg, brightnessMsg + 5);
 }

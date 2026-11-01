@@ -81,6 +81,15 @@ curl -X POST http://pixel-display.local/send-raw -d "plain=0500040101"
 
 Only `/update` needs a password, so keep the board off untrusted networks.
 
+## Preparing images
+
+Converts any image to a PNG the display can show: crops to a centred square, resizes to 32x32 and reduces colors if needed to fit the size limit. It needs Docker, and the original is left alone.
+
+```bash
+scripts/prepare-image.sh photo.jpg
+curl -F "file=@photo-32.png" http://pixel-display.local/send-png
+```
+
 ## Based on
 
 - https://github.com/derkalle4/python3-idotmatrix-library

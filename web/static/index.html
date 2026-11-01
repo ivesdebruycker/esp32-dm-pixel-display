@@ -177,6 +177,17 @@
           <label for="background">Bar colour</label>
           <input id="background" type="color" value="#000000">
         </div>
+        <fieldset class="mode">
+          <legend>Resizing</legend>
+          <label><input type="radio" name="resize" value="smooth" checked> Smooth (photos)</label>
+          <label><input type="radio" name="resize" value="pixel"> Pixel art (hard edges)</label>
+        </fieldset>
+        <div class="sliders">
+          <label for="contrast">Contrast <output id="contrast-value">100%</output></label>
+          <input id="contrast" type="range" min="0" max="200" step="5" value="100">
+          <label for="saturation">Saturation <output id="saturation-value">100%</output></label>
+          <input id="saturation" type="range" min="0" max="200" step="5" value="100">
+        </div>
         <div class="actions">
           <button id="reset-adjust" type="button">Reset</button>
           <button id="update-library" class="primary" type="button" hidden>Save to library image</button>
@@ -317,7 +328,10 @@ function formatBytes(bytes) {
   return `${Number(bytes).toLocaleString()} bytes`;
 }
 
-const DEFAULT_ADJUST = { mode: "crop", zoom: 1, x: 0.5, y: 0.5, background: "#000000" };
+const DEFAULT_ADJUST = {
+  mode: "crop", zoom: 1, x: 0.5, y: 0.5, background: "#000000",
+  contrast: 1, saturation: 1, resize: "smooth",
+};
 let adjust = { ...DEFAULT_ADJUST };
 let editingImage = null;
 let sourceUrl = null;
@@ -409,6 +423,12 @@ function drawAdjust() {
   $("pos-x").value = Math.round(adjust.x * 100);
   $("pos-y").value = Math.round(adjust.y * 100);
   $("background").value = adjust.background;
+  document.querySelectorAll('input[name="resize"]').forEach(input => { input.checked = input.value === adjust.resize; });
+  ["contrast", "saturation"].forEach(name => {
+    const percent = Math.round(adjust[name] * 100);
+    $(name).value = percent;
+    $(`${name}-value`).textContent = `${percent}%`;
+  });
   drawCropBox();
 }
 
@@ -792,6 +812,14 @@ $("background").addEventListener("input", event => {
   adjust.background = event.target.value;
   schedulePreview();
 });
+document.querySelectorAll('input[name="resize"]').forEach(input => input.addEventListener("change", () => {
+  adjust.resize = input.value;
+  schedulePreview();
+}));
+["contrast", "saturation"].forEach(name => $(name).addEventListener("input", event => {
+  adjust[name] = Number(event.target.value) / 100;
+  schedulePreview();
+}));
 $("reset-adjust").addEventListener("click", () => {
   adjust = { ...DEFAULT_ADJUST };
   schedulePreview();

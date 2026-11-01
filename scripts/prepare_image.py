@@ -3,7 +3,7 @@ import io
 import os
 import sys
 
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance, ImageOps
 
 SIZE = (32, 32)
 # Keep in sync with max_png_size in the firmware
@@ -16,29 +16,36 @@ def encode(image):
     return buffer.getvalue()
 
 
-def crop_square(image, zoom, x, y):
+def crop_square(image, zoom, x, y, resampling):
     """Crops a square around the point x, y (0 to 1), keeping it inside the image."""
     width, height = image.size
     side = min(width, height) / zoom
     left = min(max(x * width - side / 2, 0), width - side)
     top = min(max(y * height - side / 2, 0), height - side)
-    return image.resize(SIZE, Image.Resampling.LANCZOS, box=(left, top, left + side, top + side))
+    return image.resize(SIZE, resampling, box=(left, top, left + side, top + side))
 
 
-def fit_with_bars(image, background):
-    fitted = ImageOps.contain(image, SIZE, Image.Resampling.LANCZOS)
+def fit_with_bars(image, background, resampling):
+    fitted = ImageOps.contain(image, SIZE, resampling)
     canvas = Image.new("RGB", SIZE, background)
     canvas.paste(fitted, ((SIZE[0] - fitted.width) // 2, (SIZE[1] - fitted.height) // 2))
     return canvas
 
 
-def convert(source, mode="crop", zoom=1, x=0.5, y=0.5, background="#000000"):
+def convert(
+    source, mode="crop", zoom=1, x=0.5, y=0.5, background="#000000",
+    contrast=1, saturation=1, resize="smooth",
+):
     """Returns the PNG bytes and the color count if colors had to be reduced.
 
     source is a path or a binary file object. mode is "crop", which uses zoom,
-    x and y, or "fit", which adds bars in the background color. Raises
-    ValueError if the image can't be made small enough.
+    x and y, or "fit", which adds bars in the background color. contrast and
+    saturation are factors where 1 is unchanged. resize is "smooth", or "pixel"
+    which keeps hard edges and the original colors. Raises ValueError if the
+    image can't be made small enough.
     """
+    resampling = Image.Resampling.NEAREST if resize == "pixel" else Image.Resampling.LANCZOS
+
     with Image.open(source) as original:
         image = ImageOps.exif_transpose(original).convert("RGBA")
 
@@ -46,9 +53,15 @@ def convert(source, mode="crop", zoom=1, x=0.5, y=0.5, background="#000000"):
     flatten = background if mode == "fit" else "#000000"
     image = Image.alpha_composite(Image.new("RGBA", image.size, flatten), image).convert("RGB")
     if mode == "fit":
-        image = fit_with_bars(image, background)
+        image = fit_with_bars(image, background, resampling)
     else:
-        image = crop_square(image, zoom, x, y)
+        image = crop_square(image, zoom, x, y, resampling)
+
+    # applied to the final pixels, so they match what the display shows
+    if contrast != 1:
+        image = ImageEnhance.Contrast(image).enhance(contrast)
+    if saturation != 1:
+        image = ImageEnhance.Color(image).enhance(saturation)
 
     data = encode(image)
     colors = None

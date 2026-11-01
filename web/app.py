@@ -26,6 +26,7 @@ IMAGE_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "pixel-display.db"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_ZOOM = 8
+MAX_ENHANCE = 2
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 STATUS_INTERVAL = 10
 # one failed check can just be a slow moment on a weak Wi-Fi signal
@@ -317,8 +318,20 @@ def adjustments(
     x: float = Form(0.5, ge=0, le=1),
     y: float = Form(0.5, ge=0, le=1),
     background: str = Form("#000000", pattern=r"^#[0-9a-fA-F]{6}$"),
+    contrast: float = Form(1, ge=0, le=MAX_ENHANCE),
+    saturation: float = Form(1, ge=0, le=MAX_ENHANCE),
+    resize: Literal["smooth", "pixel"] = Form("smooth"),
 ):
-    return {"mode": mode, "zoom": zoom, "x": x, "y": y, "background": background}
+    return {
+        "mode": mode,
+        "zoom": zoom,
+        "x": x,
+        "y": y,
+        "background": background,
+        "contrast": contrast,
+        "saturation": saturation,
+        "resize": resize,
+    }
 
 
 def inspect_and_convert(data, settings):

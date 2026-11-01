@@ -47,8 +47,27 @@
     width: 224px; height: 224px; max-width: 100%; background: #000; border-radius: 6px;
     image-rendering: pixelated; flex: none;
   }
-  #info { flex: 1 1 200px; min-width: 0; }
-  #info p { margin: 0 0 12px; color: var(--muted); overflow-wrap: anywhere; }
+  #info { flex: 1 1 240px; min-width: 0; display: grid; gap: 12px; align-content: start; }
+  #info p { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
+  .image-column { display: grid; gap: 6px; justify-items: start; }
+  .column-title { font-weight: 600; font-size: .9rem; }
+  .image-column small { margin: 0; }
+  #source-frame { position: relative; display: inline-block; line-height: 0; touch-action: none; cursor: move; max-width: 100%; }
+  #source-frame.fit { cursor: default; touch-action: auto; }
+  #source { max-width: 224px; max-height: 224px; width: auto; height: auto; border-radius: 6px; user-select: none; background: #000; }
+  #crop-box {
+    position: absolute; border: 2px solid #fff; outline: 1px solid #000;
+    box-shadow: 0 0 0 999px rgba(0, 0, 0, .5); pointer-events: none;
+  }
+  #source-frame { overflow: hidden; border-radius: 6px; }
+  fieldset.mode { border: 0; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 16px; }
+  fieldset.mode legend { font-weight: 600; padding: 0; margin-bottom: 4px; }
+  fieldset.mode label { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; cursor: pointer; }
+  .sliders { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 12px; align-items: center; }
+  .sliders input { width: 100%; min-height: 32px; accent-color: var(--accent); }
+  .sliders output { color: var(--muted); }
+  input[type="color"] { width: 56px; height: 42px; padding: 2px; background: transparent; border: 1px solid var(--line); border-radius: 8px; }
+  [hidden] { display: none !important; }
   .actions { display: flex; flex-wrap: wrap; gap: 8px; }
   button {
     font: inherit; font-weight: 600; padding: 9px 14px; border-radius: 8px; cursor: pointer;
@@ -124,12 +143,44 @@
     <label id="drop" class="dropzone">
       <input id="file" type="file" accept="image/*">
       <strong>Drop an image here or choose a file</strong>
-      <small>It's cropped to a centred square and resized to 32×32 automatically</small>
+      <small>It's resized to 32×32 automatically, then you can adjust the crop</small>
     </label>
     <div id="result" hidden>
-      <img id="preview" alt="Preview of the converted image, enlarged">
+      <div class="image-column">
+        <span class="column-title">Original</span>
+        <div id="source-frame">
+          <img id="source" alt="The original image" draggable="false">
+          <div id="crop-box" aria-hidden="true"></div>
+        </div>
+        <small id="source-hint" class="muted">Drag to choose the crop</small>
+      </div>
+      <div class="image-column">
+        <span class="column-title">On the display</span>
+        <img id="preview" alt="Preview of the converted image, enlarged">
+      </div>
       <div id="info">
         <p id="summary"></p>
+        <fieldset class="mode">
+          <legend>Shape</legend>
+          <label><input type="radio" name="mode" value="crop" checked> Crop to fill</label>
+          <label><input type="radio" name="mode" value="fit"> Fit with bars</label>
+        </fieldset>
+        <div id="crop-controls" class="sliders">
+          <label for="zoom">Zoom <output id="zoom-value">1×</output></label>
+          <input id="zoom" type="range" min="1" max="8" step="0.1" value="1">
+          <label for="pos-x">Horizontal</label>
+          <input id="pos-x" type="range" min="0" max="100" step="1" value="50">
+          <label for="pos-y">Vertical</label>
+          <input id="pos-y" type="range" min="0" max="100" step="1" value="50">
+        </div>
+        <div id="fit-controls" class="field" hidden>
+          <label for="background">Bar colour</label>
+          <input id="background" type="color" value="#000000">
+        </div>
+        <div class="actions">
+          <button id="reset-adjust" type="button">Reset</button>
+          <button id="update-library" class="primary" type="button" hidden>Save to library image</button>
+        </div>
         <div class="actions">
           <button id="show" class="primary" type="button">Show now</button>
           <button id="add-library" type="button">Add to library</button>
@@ -266,32 +317,133 @@ function formatBytes(bytes) {
   return `${Number(bytes).toLocaleString()} bytes`;
 }
 
-function handleFile(file) {
+const DEFAULT_ADJUST = { mode: "crop", zoom: 1, x: 0.5, y: 0.5, background: "#000000" };
+let adjust = { ...DEFAULT_ADJUST };
+let editingImage = null;
+let sourceUrl = null;
+let previewTimer = null;
+let previewRequest = null;
+let previewPending = Promise.resolve();
+
+function appendAdjust(form) {
+  Object.entries(adjust).forEach(([key, value]) => form.append(key, value));
+}
+
+async function fetchPreview() {
+  if (previewRequest) previewRequest.abort();
+  const request = new AbortController();
+  previewRequest = request;
+  const form = new FormData();
+  form.append("file", sourceFile);
+  appendAdjust(form);
+  const response = await fetch("/api/convert", { method: "POST", body: form, signal: request.signal });
+  if (!response.ok) throw new Error(await errorText(response));
+  const blob = await response.blob();
+  // a newer preview has started
+  if (previewRequest !== request) return;
+  converted = blob;
+
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+  previewUrl = URL.createObjectURL(converted);
+  $("preview").src = previewUrl;
+
+  const colors = response.headers.get("X-Image-Colors");
+  const original = response.headers.get("X-Original-Size");
+  $("summary").textContent = `${sourceFile.name}: ${original} → 32×32, `
+    + formatBytes(response.headers.get("X-Image-Bytes"))
+    + (colors ? `, reduced to ${colors} colours` : "");
+}
+
+// the preview is created by the server, so wait for a pause in the changes
+function schedulePreview() {
+  drawAdjust();
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(startPreview, 200);
+}
+
+function startPreview() {
+  previewTimer = null;
+  previewPending = fetchPreview().catch(error => {
+    if (error.name !== "AbortError") setMessage(error.message, "error");
+  });
+  return previewPending;
+}
+
+async function latestPreview() {
+  if (previewTimer !== null) {
+    clearTimeout(previewTimer);
+    startPreview();
+  }
+  await previewPending;
+}
+
+// the same calculation as crop_square in prepare_image.py
+function drawCropBox() {
+  const image = $("source");
+  const box = $("crop-box");
+  const isCrop = adjust.mode === "crop";
+  const ready = image.naturalWidth > 0;
+  box.hidden = !isCrop || !ready;
+  $("source-frame").classList.toggle("fit", !isCrop);
+  $("source-hint").hidden = !isCrop || !ready;
+  if (!isCrop || !ready) return;
+
+  const width = image.clientWidth;
+  const height = image.clientHeight;
+  const side = Math.min(width, height) / adjust.zoom;
+  const left = Math.min(Math.max(adjust.x * width - side / 2, 0), width - side);
+  const top = Math.min(Math.max(adjust.y * height - side / 2, 0), height - side);
+  box.style.left = `${left}px`;
+  box.style.top = `${top}px`;
+  box.style.width = `${side}px`;
+  box.style.height = `${side}px`;
+}
+
+function drawAdjust() {
+  const isCrop = adjust.mode === "crop";
+  document.querySelectorAll('input[name="mode"]').forEach(input => { input.checked = input.value === adjust.mode; });
+  $("crop-controls").hidden = !isCrop;
+  $("fit-controls").hidden = isCrop;
+  $("zoom").value = adjust.zoom;
+  $("zoom-value").textContent = `${Number(adjust.zoom).toFixed(1)}×`;
+  $("pos-x").value = Math.round(adjust.x * 100);
+  $("pos-y").value = Math.round(adjust.y * 100);
+  $("background").value = adjust.background;
+  drawCropBox();
+}
+
+function showEditing() {
+  $("update-library").hidden = editingImage === null;
+  if (editingImage !== null) $("update-library").textContent = `Save to ${editingImage.name}`;
+}
+
+function handleFile(file, image = null) {
   if (!file) return;
   sourceFile = file;
+  editingImage = image;
+  adjust = { ...DEFAULT_ADJUST, ...(image && image.settings ? image.settings : {}) };
+
+  if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+  sourceUrl = URL.createObjectURL(file);
+  $("source").src = sourceUrl;
+
   run(`Converting ${file.name}…`, async () => {
-    const form = new FormData();
-    form.append("file", file);
-    const response = await post("/api/convert", form);
-    converted = await response.blob();
-
-    if (previewUrl) URL.revokeObjectURL(previewUrl);
-    previewUrl = URL.createObjectURL(converted);
-    $("preview").src = previewUrl;
-
-    const colors = response.headers.get("X-Image-Colors");
-    const original = response.headers.get("X-Original-Size");
-    $("summary").textContent = `${file.name}: ${original} → 32×32, `
-      + formatBytes(response.headers.get("X-Image-Bytes"))
-      + (colors ? `, reduced to ${colors} colours` : "");
+    clearTimeout(previewTimer);
+    previewTimer = null;
+    await fetchPreview();
     $("result").hidden = false;
-    return "Ready. Check the preview, then show or save it.";
+    showEditing();
+    drawAdjust();
+    return image
+      ? `Adjusting ${image.name}. Save when it looks right.`
+      : "Ready. Adjust the crop if needed, then show or save it.";
   });
 }
 
 function sendConverted(url, label) {
   if (!converted) return;
   run(label, async () => {
+    await latestPreview();
     const form = new FormData();
     form.append("file", converted, "image.png");
     const response = await post(url, form);
@@ -525,6 +677,16 @@ function renderLibrary() {
         return (await response.json()).message;
       })),
       add,
+      button("Adjust", async () => {
+        try {
+          const response = await requestWithMethod(`/api/library/${image.id}/original`, "GET");
+          const original = await response.blob();
+          handleFile(new File([original], image.name), image);
+          $("image-title").scrollIntoView({ behavior: "smooth" });
+        } catch (error) {
+          setMessage(error.message, "error");
+        }
+      }),
       button("Delete", () => {
         const usage = image.used_in ? ` It's used in ${image.used_in} playlist(s) and will be removed from them.` : "";
         if (!confirm(`Delete ${image.name}?${usage} This can't be undone.`)) return;
@@ -610,6 +772,62 @@ $("clear").addEventListener("click", () => {
   }
 });
 
+document.querySelectorAll('input[name="mode"]').forEach(input => input.addEventListener("change", () => {
+  adjust.mode = input.value;
+  schedulePreview();
+}));
+$("zoom").addEventListener("input", event => {
+  adjust.zoom = Number(event.target.value);
+  schedulePreview();
+});
+$("pos-x").addEventListener("input", event => {
+  adjust.x = Number(event.target.value) / 100;
+  schedulePreview();
+});
+$("pos-y").addEventListener("input", event => {
+  adjust.y = Number(event.target.value) / 100;
+  schedulePreview();
+});
+$("background").addEventListener("input", event => {
+  adjust.background = event.target.value;
+  schedulePreview();
+});
+$("reset-adjust").addEventListener("click", () => {
+  adjust = { ...DEFAULT_ADJUST };
+  schedulePreview();
+});
+$("update-library").addEventListener("click", () => {
+  const image = editingImage;
+  run(`Saving ${image.name}…`, async () => {
+    const form = new FormData();
+    appendAdjust(form);
+    const response = await fetch(`/api/library/${image.id}/adjust`, { method: "PUT", body: form });
+    if (!response.ok) throw new Error(await errorText(response));
+    editingImage = await response.json();
+    await loadData();
+    return `${image.name} saved. Playlists use it the next time it comes up.`;
+  });
+});
+
+$("source").addEventListener("load", drawCropBox);
+window.addEventListener("resize", drawCropBox);
+
+function moveCropTo(event) {
+  const rect = $("source").getBoundingClientRect();
+  adjust.x = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1);
+  adjust.y = Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1);
+  schedulePreview();
+}
+$("source-frame").addEventListener("pointerdown", event => {
+  if (adjust.mode !== "crop") return;
+  event.preventDefault();
+  $("source-frame").setPointerCapture(event.pointerId);
+  moveCropTo(event);
+});
+$("source-frame").addEventListener("pointermove", event => {
+  if ($("source-frame").hasPointerCapture(event.pointerId)) moveCropTo(event);
+});
+
 $("screen-toggle").addEventListener("click", () => {
   const on = !screenOn;
   run(on ? "Turning the screen on…" : "Turning the screen off…", async () => {
@@ -639,6 +857,7 @@ $("add-library").addEventListener("click", () => {
   run(`Adding ${sourceFile.name} to the library…`, async () => {
     const form = new FormData();
     form.append("file", sourceFile);
+    appendAdjust(form);
     await post("/api/library", form);
     await loadData();
     return "Added to the library";

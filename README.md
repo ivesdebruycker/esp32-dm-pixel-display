@@ -86,7 +86,7 @@ Only `/update` needs a password, so keep the board off untrusted networks.
 
 ## Web UI
 
-A page to upload images, with automatic resizing and a preview, to keep an image library and playlists, and to control the display. It runs in Docker and passes requests on to the board.
+A page to upload images, with automatic resizing, a preview and crop or fit controls, to keep an image library and playlists, and to control the display. It runs in Docker and passes requests on to the board.
 
 Playlists have a duration per image (at least 5 seconds) and aren't limited to the board's 10 slots, because the server sends images one at a time and keeps the library in a Docker volume. They resume when the container restarts. When the server is off, the last image stays on screen until the board is told otherwise.
 

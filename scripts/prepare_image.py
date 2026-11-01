@@ -16,19 +16,39 @@ def encode(image):
     return buffer.getvalue()
 
 
-def convert(source):
+def crop_square(image, zoom, x, y):
+    """Crops a square around the point x, y (0 to 1), keeping it inside the image."""
+    width, height = image.size
+    side = min(width, height) / zoom
+    left = min(max(x * width - side / 2, 0), width - side)
+    top = min(max(y * height - side / 2, 0), height - side)
+    return image.resize(SIZE, Image.Resampling.LANCZOS, box=(left, top, left + side, top + side))
+
+
+def fit_with_bars(image, background):
+    fitted = ImageOps.contain(image, SIZE, Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", SIZE, background)
+    canvas.paste(fitted, ((SIZE[0] - fitted.width) // 2, (SIZE[1] - fitted.height) // 2))
+    return canvas
+
+
+def convert(source, mode="crop", zoom=1, x=0.5, y=0.5, background="#000000"):
     """Returns the PNG bytes and the color count if colors had to be reduced.
 
-    source is a path or a binary file object. Raises ValueError if the image
-    can't be made small enough.
+    source is a path or a binary file object. mode is "crop", which uses zoom,
+    x and y, or "fit", which adds bars in the background color. Raises
+    ValueError if the image can't be made small enough.
     """
     with Image.open(source) as original:
         image = ImageOps.exif_transpose(original).convert("RGBA")
 
-    # the display has no transparency, so flatten onto black
-    background = Image.new("RGBA", image.size, (0, 0, 0, 255))
-    image = Image.alpha_composite(background, image).convert("RGB")
-    image = ImageOps.fit(image, SIZE, Image.Resampling.LANCZOS)
+    # the display has no transparency, so flatten it
+    flatten = background if mode == "fit" else "#000000"
+    image = Image.alpha_composite(Image.new("RGBA", image.size, flatten), image).convert("RGB")
+    if mode == "fit":
+        image = fit_with_bars(image, background)
+    else:
+        image = crop_square(image, zoom, x, y)
 
     data = encode(image)
     colors = None

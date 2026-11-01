@@ -1,6 +1,7 @@
 """Web UI backend: converts images, runs playlists and passes requests on to the board."""
 import asyncio
 import io
+import json
 import logging
 import os
 import sqlite3
@@ -8,11 +9,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -23,6 +25,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 IMAGE_DIR = DATA_DIR / "images"
 DB_PATH = DATA_DIR / "pixel-display.db"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_ZOOM = 8
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 STATUS_INTERVAL = 10
 # one failed check can just be a slow moment on a weak Wi-Fi signal
@@ -98,6 +101,10 @@ def init_storage():
             );
             """
         )
+        # images added before crop and fit settings existed have none
+        columns = [row["name"] for row in connection.execute("PRAGMA table_info(images)")]
+        if "settings" not in columns:
+            connection.execute("ALTER TABLE images ADD COLUMN settings TEXT")
 
 
 async def board_request(method, path, timeout=30, still_wanted=None, **kwargs):
@@ -304,15 +311,25 @@ async def read_upload(file, limit):
     return data
 
 
-def inspect_and_convert(data):
+def adjustments(
+    mode: Literal["crop", "fit"] = Form("crop"),
+    zoom: float = Form(1, ge=1, le=MAX_ZOOM),
+    x: float = Form(0.5, ge=0, le=1),
+    y: float = Form(0.5, ge=0, le=1),
+    background: str = Form("#000000", pattern=r"^#[0-9a-fA-F]{6}$"),
+):
+    return {"mode": mode, "zoom": zoom, "x": x, "y": y, "background": background}
+
+
+def inspect_and_convert(data, settings):
     with Image.open(io.BytesIO(data)) as image:
-        original_size = image.size
-    return (*convert(io.BytesIO(data)), original_size)
+        original_size = ImageOps.exif_transpose(image).size
+    return (*convert(io.BytesIO(data), **settings), original_size)
 
 
-async def convert_upload(data):
+async def convert_upload(data, settings):
     try:
-        return await run_in_threadpool(inspect_and_convert, data)
+        return await run_in_threadpool(inspect_and_convert, data, settings)
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
         raise HTTPException(400, "This file can't be read as an image") from error
     except ValueError as error:
@@ -320,9 +337,9 @@ async def convert_upload(data):
 
 
 @app.post("/api/convert")
-async def convert_image(file: UploadFile = File(...)):
+async def convert_image(file: UploadFile = File(...), settings: dict = Depends(adjustments)):
     data = await read_upload(file, MAX_UPLOAD_BYTES)
-    png, colors, original_size = await convert_upload(data)
+    png, colors, original_size = await convert_upload(data, settings)
     return Response(
         png,
         media_type="image/png",
@@ -411,6 +428,7 @@ def image_row_to_dict(row):
         "name": row["name"],
         "bytes": row["bytes"],
         "used_in": row["used_in"],
+        "settings": json.loads(row["settings"]) if row["settings"] else None,
         "url": f"/api/library/{row['id']}.png",
     }
 
@@ -429,9 +447,9 @@ async def library():
 
 
 @app.post("/api/library", status_code=201)
-async def add_to_library(file: UploadFile = File(...)):
+async def add_to_library(file: UploadFile = File(...), settings: dict = Depends(adjustments)):
     data = await read_upload(file, MAX_UPLOAD_BYTES)
-    png, _, _ = await convert_upload(data)
+    png, _, _ = await convert_upload(data, settings)
     image_id = uuid.uuid4().hex
     name = Path(file.filename or "image").stem[:100] or "image"
 
@@ -440,8 +458,8 @@ async def add_to_library(file: UploadFile = File(...)):
     (IMAGE_DIR / f"{image_id}.png").write_bytes(png)
     with db() as connection:
         connection.execute(
-            "INSERT INTO images (id, name, bytes, created_at) VALUES (?, ?, ?, ?)",
-            (image_id, name, len(png), time.time()),
+            "INSERT INTO images (id, name, bytes, created_at, settings) VALUES (?, ?, ?, ?, ?)",
+            (image_id, name, len(png), time.time(), json.dumps(settings)),
         )
         row = connection.execute(f"{IMAGE_QUERY} WHERE images.id = ?", (image_id,)).fetchone()
     return image_row_to_dict(row)
@@ -457,7 +475,44 @@ def require_image(image_id):
 @app.get("/api/library/{image_id}.png")
 async def library_image(image_id: str):
     require_image(image_id)
-    return FileResponse(IMAGE_DIR / f"{image_id}.png", media_type="image/png")
+    # images can change when they're adjusted, so browsers have to check for a new one
+    return FileResponse(
+        IMAGE_DIR / f"{image_id}.png", media_type="image/png", headers={"Cache-Control": "no-cache"}
+    )
+
+
+@app.get("/api/library/{image_id}/original")
+async def library_original(image_id: str):
+    require_image(image_id)
+    path = IMAGE_DIR / f"{image_id}.original"
+    if not path.exists():
+        raise HTTPException(404, "The original of this image is missing")
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.put("/api/library/{image_id}/adjust")
+async def adjust_library_image(image_id: str, settings: dict = Depends(adjustments)):
+    """Converts the kept original again, playlists use the new version from the next image."""
+    require_image(image_id)
+    path = IMAGE_DIR / f"{image_id}.original"
+    if not path.exists():
+        raise HTTPException(404, "The original of this image is missing")
+    png, _, _ = await convert_upload(path.read_bytes(), settings)
+
+    temporary = IMAGE_DIR / f"{image_id}.png.new"
+    temporary.write_bytes(png)
+    temporary.replace(IMAGE_DIR / f"{image_id}.png")
+    with db() as connection:
+        connection.execute(
+            "UPDATE images SET bytes = ?, settings = ? WHERE id = ?",
+            (len(png), json.dumps(settings), image_id),
+        )
+        row = connection.execute(f"{IMAGE_QUERY} WHERE images.id = ?", (image_id,)).fetchone()
+    return image_row_to_dict(row)
 
 
 @app.post("/api/library/{image_id}/show")
@@ -659,4 +714,5 @@ async def limits():
 
 @app.get("/")
 async def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # browsers have to check for a new version after an update
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})

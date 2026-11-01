@@ -65,6 +65,7 @@ Replace `pixel-display.local` with the board's IP address if needed.
 |---|---|
 | `GET /status` | Connection state, mode, image count, memory and storage |
 | `POST /send-png` | Store a PNG and show it, multipart field with a `.png` filename. Doesn't change the mode, in clock mode it's only stored |
+| `POST /show-png` | Show a PNG without storing it, same upload and limits. A running slideshow continues after 15 seconds, and the clock stops |
 | `POST /start-clock` | Show the clock, this stops the slideshow |
 | `POST /slideshow/start` | Cycle through stored images every 15 seconds |
 | `POST /slideshow/stop` | Stop cycling and leave the current content |
@@ -89,6 +90,14 @@ Converts any image to a PNG the display can show: crops to a centred square, res
 scripts/prepare-image.sh photo.jpg
 curl -F "file=@photo-32.png" http://pixel-display.local/send-png
 ```
+
+To show an image right away without storing it, converting it only if needed:
+
+```bash
+scripts/show-image.sh photo.jpg 192.168.1.60
+```
+
+The host defaults to `$PIXEL_DISPLAY_HOST`, then `pixel-display.local`.
 
 ## Based on
 

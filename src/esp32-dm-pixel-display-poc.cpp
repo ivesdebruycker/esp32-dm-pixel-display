@@ -84,6 +84,8 @@ static volatile bool restore_display = false;
 // Entering draw mode blanks the screen, so only do it when the display isn't in it yet
 static volatile bool draw_mode_active = false;
 static volatile bool show_upload = false;
+// BLE traffic slows down Wi-Fi a lot, so the slideshow waits during a firmware update
+static volatile bool ota_active = false;
 static SemaphoreHandle_t bleMutex;
 static BLEClient *pClient = nullptr;
 
@@ -736,9 +738,21 @@ std::vector<uint8_t> png_data;
 int upload_status = 0;
 String upload_message;
 
-void handlePngUpload()
+// The web server also calls upload handlers for other POST requests, and
+// server.upload() then returns an invalid reference that crashes the board
+bool isMultipartUpload()
 {
-  // handle uploaded file, the response is sent by handlePngDone
+  return server.header("Content-Type").startsWith("multipart/");
+}
+
+// Collects and checks an uploaded PNG, returns true once it's complete and valid
+bool receivePng()
+{
+  if (!isMultipartUpload())
+  {
+    return false;
+  }
+
   HTTPUpload &upload = server.upload();
   if (upload.status == UPLOAD_FILE_START)
   {
@@ -754,7 +768,7 @@ void handlePngUpload()
       png_data.clear();
       upload_status = 413;
       upload_message = "File too large";
-      return;
+      return false;
     }
     png_data.insert(png_data.end(), upload.buf, upload.buf + upload.currentSize);
   }
@@ -767,32 +781,44 @@ void handlePngUpload()
     {
       upload_status = 400;
       upload_message = "File must be a PNG";
-      return;
+      return false;
     }
 
-    String path = imagePath(next_upload_slot);
-    File file = LittleFS.open(path, "w");
-    size_t written = file ? file.write(png_data.data(), png_data.size()) : 0;
-    if (file)
-    {
-      file.close();
-    }
-    if (written != png_data.size())
-    {
-      LittleFS.remove(path);
-      upload_status = 507;
-      upload_message = "Not enough storage";
-      return;
-    }
-
-    Serial.printf("Stored in slot %d\n", next_upload_slot);
-    current_display_file = next_upload_slot;
-    next_upload_slot = (next_upload_slot + 1) % max_files;
-    saveSettings();
-    show_upload = true;
     upload_status = 200;
-    upload_message = "File stored";
+    return true;
   }
+  return false;
+}
+
+// handle uploaded file, the response is sent by handlePngDone
+void handlePngUpload()
+{
+  if (!receivePng())
+  {
+    return;
+  }
+
+  String path = imagePath(next_upload_slot);
+  File file = LittleFS.open(path, "w");
+  size_t written = file ? file.write(png_data.data(), png_data.size()) : 0;
+  if (file)
+  {
+    file.close();
+  }
+  if (written != png_data.size())
+  {
+    LittleFS.remove(path);
+    upload_status = 507;
+    upload_message = "Not enough storage";
+    return;
+  }
+
+  Serial.printf("Stored in slot %d\n", next_upload_slot);
+  current_display_file = next_upload_slot;
+  next_upload_slot = (next_upload_slot + 1) % max_files;
+  saveSettings();
+  show_upload = true;
+  upload_message = "File stored";
 }
 
 void handlePngDone()
@@ -801,6 +827,33 @@ void handlePngDone()
   upload_status = 0;
   png_data.clear();
   png_data.shrink_to_fit();
+}
+
+// Shows an uploaded image without storing it
+void handleShowPngUpload()
+{
+  receivePng();
+}
+
+void handleShowPngDone()
+{
+  if (upload_status == 200)
+  {
+    // the clock won't be on screen anymore
+    if (display_mode == MODE_CLOCK)
+    {
+      setDisplayMode(MODE_IDLE);
+    }
+    if (!draw_mode_active)
+    {
+      draw_mode_active = sendCommand(commands.setDrawMode(1));
+    }
+    last_display_change = millis(); // a running slideshow gives it a full turn
+    bool sent = sendCommand(createPNGPayloads(png_data));
+    upload_status = sent ? 200 : 503;
+    upload_message = sent ? "Image shown" : "Display not connected";
+  }
+  handlePngDone();
 }
 
 void handleStartClock()
@@ -873,6 +926,11 @@ bool ota_authorized = false;
 
 void handleUpdateUpload()
 {
+  if (!isMultipartUpload())
+  {
+    return;
+  }
+
   HTTPUpload &upload = server.upload();
   if (upload.status == UPLOAD_FILE_START)
   {
@@ -880,6 +938,7 @@ void handleUpdateUpload()
     if (ota_authorized)
     {
       Serial.printf("OTA start: %s\n", upload.filename.c_str());
+      ota_active = true;
       Update.begin(UPDATE_SIZE_UNKNOWN);
     }
   }
@@ -894,10 +953,12 @@ void handleUpdateUpload()
   else if (upload.status == UPLOAD_FILE_END)
   {
     Update.end(true);
+    ota_active = false;
     Serial.printf("OTA end: %d bytes, %s\n", upload.totalSize, Update.errorString());
   }
   else if (upload.status == UPLOAD_FILE_ABORTED)
   {
+    ota_active = false;
     Update.abort();
   }
 }
@@ -929,13 +990,20 @@ void setupWebServer()
   WiFi.setHostname(hostname);
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
+  // by default it joins the first access point found, not the strongest
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
   WiFi.begin(ssid, password); // Connect to the network
   Serial.print("Connecting to ");
   Serial.print(ssid);
   Serial.println(" ...");
 
+  const char *collected_headers[] = {"Content-Type"};
+  server.collectHeaders(collected_headers, 1);
+
   server.on("/send-raw", HTTP_POST, handlePost);
   server.on("/send-png", HTTP_POST, handlePngDone, handlePngUpload);
+  server.on("/show-png", HTTP_POST, handleShowPngDone, handleShowPngUpload);
   server.on("/start-clock", HTTP_POST, handleStartClock);
   server.on("/slideshow/start", HTTP_POST, handleStartSlideshow);
   server.on("/slideshow/stop", HTTP_POST, handleStopSlideshow);
@@ -957,6 +1025,12 @@ void bleTask(void *parameter)
   scan->setWindow(50); // leave airtime for Wi-Fi
   int failed_connects = 0;
 
+  // both share one radio, so give Wi-Fi the chance to connect first
+  for (int i = 0; i < 300 && WiFi.status() != WL_CONNECTED; i++)
+  {
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+
   for (;;)
   {
     if (paired)
@@ -971,6 +1045,12 @@ void bleTask(void *parameter)
         {
           sendCommand(commands.clock(3, true, true, 100, 100, 180));
         }
+      }
+
+      if (ota_active)
+      {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
       }
 
       // show a new upload right away, the clock keeps running and only stores it

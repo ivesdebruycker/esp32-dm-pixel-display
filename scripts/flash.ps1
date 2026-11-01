@@ -3,8 +3,8 @@
 # partition table, and the slot layout means stored images may need uploading again.
 param(
   [string]$Port = 'COM5',
-  [string]$BuildHost = 'wsl-dev',
-  [string]$RemoteDir = 'code/personal/esp32-dm-pixel-display-poc/dist',
+  [Parameter(Mandatory = $true)][string]$BuildHost,
+  [Parameter(Mandatory = $true)][string]$RemoteDir,
   [Parameter(Mandatory = $true)][string]$Esptool
 )
 

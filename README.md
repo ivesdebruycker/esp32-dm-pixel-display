@@ -1,25 +1,43 @@
 # ESP32 iDotMatrix Pixel Display
 
-Firmware for an ESP32-C3 mounted on the back of an iDotMatrix pixel display. It keeps the display connected over BLE and lets you control it over HTTP on your Wi-Fi network.
+Control a 32x32 iDotMatrix pixel display over your network, using an ESP32-C3 mounted on its back and an optional web UI in Docker. The firmware keeps the display connected over BLE and offers an HTTP API on your Wi-Fi network.
 
 ```text
-HTTP client → Wi-Fi → ESP32-C3 → BLE → iDotMatrix display
+Web UI or HTTP client → Wi-Fi → ESP32-C3 → BLE → iDotMatrix display
 ```
 
+<img src="docs/web-ui.png" alt="The web UI with a sunset image being cropped, a preview of the 32x32 result and a playlist" width="480">
+
 ## Features
+
+Firmware:
 
 - Reconnects to the display on its own after it restarts or drops the link
 - HTTP stays available while the display is disconnected
 - Stores up to 10 PNGs in flash, replacing the oldest first
+- Clock, slideshow, brightness and screen on/off
 - Rejects PNGs over 3,663 bytes, the largest size confirmed working (a 4,196 byte PNG sent as two chunks wasn't shown)
-- Remembers the display mode across restarts
+- Remembers its settings across restarts
 - Firmware updates over Wi-Fi
+
+Web UI:
+
+- Upload any image with automatic resizing and a live preview
+- Crop position and zoom, or fit with coloured bars
+- Contrast, saturation and pixel-art resizing
+- An image library, including adding many images at once
+- Named playlists with a duration per image, and click an image to skip to it
+- Brightness, screen, clock and slideshow controls
+
+## Hardware
+
+- An ESP32-C3 board with USB, tested with a generic one with 4 MB of flash
+- An iDotMatrix display, tested with a 32x32 panel
+- A 2.4 GHz Wi-Fi network
 
 ## Setup
 
-Copy `include/secrets.example.h` to `include/secrets.h` and fill it in. `secrets.h` is gitignored.
-
-The display's BLE address is `displayAddress` in `src/esp32-dm-pixel-display-poc.cpp`.
+Copy `include/secrets.example.h` to `include/secrets.h` and fill it in. `secrets.h` is gitignored. You can find your display's Bluetooth address with any BLE scanner app.
 
 ## Build
 
@@ -38,7 +56,7 @@ Binaries end up in `dist/`.
 Run this on the Windows machine the board is plugged into. It fetches `dist/` from the build host over SSH and needs the [esptool](https://github.com/espressif/esptool/releases) executable.
 
 ```powershell
-scripts\flash.ps1 -Esptool C:\path\to\esptool.exe -Port COM5
+scripts\flash.ps1 -Esptool C:\path\to\esptool.exe -Port COM5 -BuildHost my-build-host -RemoteDir path/to/repo/dist
 ```
 
 ### Afterwards, over Wi-Fi
@@ -63,7 +81,7 @@ Replace `pixel-display.local` with the board's IP address if needed.
 
 | Method and path | Purpose |
 |---|---|
-| `GET /status` | Connection state, mode, image count, memory and storage |
+| `GET /status` | Connection state, mode, brightness, screen, image count, memory and storage |
 | `POST /send-png` | Store a PNG and show it, multipart field with a `.png` filename. Doesn't change the mode, in clock mode it's only stored |
 | `POST /show-png` | Show a PNG without storing it, same upload and limits. A running slideshow continues after 15 seconds, and the clock stops |
 | `POST /brightness` | Set brightness with `value` from 5 to 100, kept across restarts |
@@ -77,7 +95,7 @@ Replace `pixel-display.local` with the board's IP address if needed.
 
 ```bash
 curl http://pixel-display.local/status
-curl -F "file=@mushroom.png" http://pixel-display.local/send-png
+curl -F "file=@image.png" http://pixel-display.local/send-png
 curl -X POST http://pixel-display.local/start-clock
 curl -X POST http://pixel-display.local/send-raw -d "plain=0500040101"
 ```
@@ -86,19 +104,20 @@ Only `/update` needs a password, so keep the board off untrusted networks.
 
 ## Web UI
 
-A page to upload images, with automatic resizing, a preview and crop or fit controls, to keep an image library and playlists, and to control the display. It runs in Docker and passes requests on to the board.
+A page to upload and adjust images, keep an image library and playlists, and control the display. It runs in Docker and passes requests on to the board.
 
-Playlists have a duration per image (at least 5 seconds) and aren't limited to the board's 10 slots, because the server sends images one at a time and keeps the library in a Docker volume. They resume when the container restarts. When the server is off, the last image stays on screen until the board is told otherwise.
+Library images keep their originals, so **Adjust** can change the crop or colours later. Playlists have a duration per image (at least 5 seconds) and aren't limited to the board's 10 slots, because the server sends images one at a time and keeps the library in a Docker volume. They resume when the container restarts. When the server is off, the last image stays on screen until the board is told otherwise.
 
 ```bash
-PIXEL_DISPLAY_HOST=192.168.1.60 docker compose up -d --build
+cp .env.example .env    # then set the board's address in .env
+docker compose up -d --build
 ```
 
 Open port 8032 on that machine, set `WEB_PORT` to use another one. It has no login, so only run it on a network you trust. It restarts along with Docker. `docker compose down` removes the container and keeps the library, `docker compose down -v` also deletes the library and playlists.
 
 ## Preparing images
 
-Converts any image to a PNG the display can show: crops to a centred square, resizes to 32x32 and reduces colors if needed to fit the size limit. It needs Docker, and the original is left alone.
+For the command line, without the web UI. This converts any image to a PNG the display can show: crops to a centred square, resizes to 32x32 and reduces colors if needed to fit the size limit. It needs Docker, and the original is left alone.
 
 ```bash
 scripts/prepare-image.sh photo.jpg
@@ -108,7 +127,7 @@ curl -F "file=@photo-32.png" http://pixel-display.local/send-png
 To show an image right away without storing it, converting it only if needed:
 
 ```bash
-scripts/show-image.sh photo.jpg 192.168.1.60
+scripts/show-image.sh photo.jpg board-address
 ```
 
 The host defaults to `$PIXEL_DISPLAY_HOST`, then `pixel-display.local`.
@@ -119,11 +138,3 @@ The host defaults to `$PIXEL_DISPLAY_HOST`, then `pixel-display.local`.
 - https://github.com/nj-designs/go-idot
 - https://github.com/Kezii/esp32cam_rs
 - https://github.com/ivesdebruycker/esp32-r2d2
-
-## References
-
-- https://micropython.org/download/ESP32_GENERIC/
-- https://www.flamingo-tech.nl/2021/03/21/installing-and-using-esptools/
-- https://docs.micropython.org/en/latest/esp8266/tutorial/intro.html
-- https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers?tab=downloads
-- https://tttapa.github.io/ESP8266/Chap12%20-%20Uploading%20to%20Server.html

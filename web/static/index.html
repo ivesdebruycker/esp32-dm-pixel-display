@@ -65,6 +65,9 @@
   #message.error { color: var(--bad); }
   #message.busy { color: var(--muted); }
   .spacer { flex: 1 1 auto; }
+  .brightness-row { align-items: center; margin-bottom: 12px; }
+  #brightness { flex: 1 1 160px; min-width: 120px; min-height: 42px; accent-color: var(--accent); }
+  #brightness-value { min-width: 3.5em; font-weight: 600; text-align: right; }
   .muted { color: var(--muted); margin: 0 0 12px; }
   .field { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
   select, input[type="number"] {
@@ -167,6 +170,12 @@
 
   <section class="panel" aria-labelledby="control-title">
     <h2 id="control-title">Display control</h2>
+    <div class="actions brightness-row">
+      <button id="screen-toggle" type="button">Turn screen off</button>
+      <label class="field brightness" for="brightness">Brightness</label>
+      <input id="brightness" type="range" min="5" max="100" step="5" value="100">
+      <output id="brightness-value" for="brightness">–</output>
+    </div>
     <div class="actions">
       <button id="slideshow-start" type="button">Start slideshow</button>
       <button id="slideshow-stop" type="button">Stop slideshow</button>
@@ -189,6 +198,8 @@ let library = [];
 let playlists = [];
 let selectedPlaylistId = null;
 let currentPlayer = null;
+let screenOn = true;
+let brightnessMoving = false;
 let limits = { min_duration: 5, max_duration: 86400, default_duration: 15 };
 
 function setMessage(text, kind = "") {
@@ -328,6 +339,16 @@ async function refreshStatus() {
   const mode = online ? board.mode : null;
   $("slideshow-start").setAttribute("aria-pressed", mode === "slideshow");
   $("clock").setAttribute("aria-pressed", mode === "clock");
+
+  screenOn = online ? board.screen_on !== false : true;
+  $("screen-toggle").textContent = screenOn ? "Turn screen off" : "Turn screen on";
+  $("screen-toggle").setAttribute("aria-pressed", !screenOn);
+  // leave the slider alone while it's being moved
+  if (!brightnessMoving && !busy) {
+    const known = online && typeof board.brightness === "number";
+    if (known) $("brightness").value = board.brightness;
+    $("brightness-value").textContent = known ? `${board.brightness}%` : "–";
+  }
 
   if (status) showPlayer(status.player);
 }
@@ -587,6 +608,30 @@ $("clear").addEventListener("click", () => {
   if (confirm("Remove all images stored on the board? This can't be undone.")) {
     sendCommand("/api/images/clear", "Removing the stored images…");
   }
+});
+
+$("screen-toggle").addEventListener("click", () => {
+  const on = !screenOn;
+  run(on ? "Turning the screen on…" : "Turning the screen off…", async () => {
+    return (await sendJson("/api/screen", "POST", { on })).message;
+  });
+});
+$("brightness").addEventListener("input", event => {
+  brightnessMoving = true;
+  $("brightness-value").textContent = `${event.target.value}%`;
+});
+// sent when the slider is released, the board handles one request at a time
+$("brightness").addEventListener("change", event => {
+  brightnessMoving = false;
+  const value = Number(event.target.value);
+  if (busy) {
+    setMessage("The board is busy, try again in a moment", "error");
+    refreshStatus();
+    return;
+  }
+  run("Setting the brightness…", async () => {
+    return (await sendJson("/api/brightness", "POST", { value })).message;
+  });
 });
 
 $("add-library").addEventListener("click", () => {

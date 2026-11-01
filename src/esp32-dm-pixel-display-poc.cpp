@@ -75,6 +75,9 @@ enum DisplayMode
   MODE_CLOCK = 2
 };
 static volatile DisplayMode display_mode = MODE_SLIDESHOW;
+// 0 until it's set for the first time, the display's own value isn't known
+static volatile int brightness_pct = 0;
+static volatile bool screen_on = true;
 
 static volatile unsigned long last_display_change = 0;
 
@@ -705,6 +708,8 @@ void saveSettings()
   {
     file.write((uint8_t)display_mode);
     file.write((uint8_t)next_upload_slot);
+    file.write((uint8_t)brightness_pct);
+    file.write((uint8_t)(screen_on ? 1 : 0));
     file.close();
   }
 }
@@ -717,10 +722,16 @@ void loadSettings()
   }
 
   File file = LittleFS.open("/settings", "r");
-  if (file && file.size() == 2)
+  if (file && file.size() >= 2)
   {
     display_mode = (DisplayMode)file.read();
     next_upload_slot = file.read() % max_files;
+  }
+  // older firmware didn't store these
+  if (file && file.size() >= 4)
+  {
+    brightness_pct = file.read();
+    screen_on = file.read() != 0;
   }
   if (file)
   {
@@ -895,6 +906,43 @@ void handleClearImages()
   server.send(200, "text/plain", "Images removed");
 }
 
+void handleBrightness()
+{
+  int value = server.arg("value").toInt();
+  if (value < 5 || value > 100)
+  {
+    server.send(400, "text/plain", "Brightness must be 5 to 100");
+    return;
+  }
+  if (!sendCommand(commands.setBrightness(value)))
+  {
+    server.send(503, "text/plain", "Display not connected");
+    return;
+  }
+  brightness_pct = value;
+  saveSettings();
+  server.send(200, "text/plain", "Brightness set");
+}
+
+void handleScreen()
+{
+  String on = server.arg("on");
+  if (on != "0" && on != "1")
+  {
+    server.send(400, "text/plain", "on must be 0 or 1");
+    return;
+  }
+  bool turn_on = on == "1";
+  if (!sendCommand(turn_on ? commands.on() : commands.off()))
+  {
+    server.send(503, "text/plain", "Display not connected");
+    return;
+  }
+  screen_on = turn_on;
+  saveSettings();
+  server.send(200, "text/plain", turn_on ? "Screen on" : "Screen off");
+}
+
 void handleStatus()
 {
   const char *modes[] = {"idle", "slideshow", "clock"};
@@ -902,7 +950,11 @@ void handleStatus()
   json += paired ? "true" : "false";
   json += ",\"mode\":\"";
   json += modes[display_mode];
-  json += "\",\"images\":";
+  json += "\",\"brightness\":";
+  json += brightness_pct > 0 ? String(brightness_pct) : "null";
+  json += ",\"screen_on\":";
+  json += screen_on ? "true" : "false";
+  json += ",\"images\":";
   json += countImages();
   json += ",\"max_images\":";
   json += max_files;
@@ -1008,6 +1060,8 @@ void setupWebServer()
   server.on("/slideshow/start", HTTP_POST, handleStartSlideshow);
   server.on("/slideshow/stop", HTTP_POST, handleStopSlideshow);
   server.on("/images/clear", HTTP_POST, handleClearImages);
+  server.on("/brightness", HTTP_POST, handleBrightness);
+  server.on("/screen", HTTP_POST, handleScreen);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.begin();
@@ -1041,6 +1095,14 @@ void bleTask(void *parameter)
         restore_display = false;
         draw_mode_active = false;
         last_display_change = 0;
+        if (brightness_pct > 0)
+        {
+          sendCommand(commands.setBrightness(brightness_pct));
+        }
+        if (!screen_on)
+        {
+          sendCommand(commands.off());
+        }
         if (display_mode == MODE_CLOCK)
         {
           sendCommand(commands.clock(3, true, true, 100, 100, 180));

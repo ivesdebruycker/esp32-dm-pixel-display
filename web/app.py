@@ -378,6 +378,28 @@ async def clock():
     return await command("/start-clock")
 
 
+class Brightness(BaseModel):
+    value: int = Field(ge=5, le=100)
+
+
+class Screen(BaseModel):
+    on: bool
+
+
+@app.post("/api/brightness")
+async def brightness(body: Brightness):
+    response = await board_request("POST", "/brightness", data={"value": body.value})
+    await refresh_status()
+    return {"message": response.text}
+
+
+@app.post("/api/screen")
+async def screen(body: Screen):
+    response = await board_request("POST", "/screen", data={"on": "1" if body.on else "0"})
+    await refresh_status()
+    return {"message": response.text}
+
+
 @app.post("/api/images/clear")
 async def clear_images():
     return await command("/images/clear")

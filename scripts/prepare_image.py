@@ -16,7 +16,12 @@ def encode(image):
     return buffer.getvalue()
 
 
-def main(source, target):
+def convert(source):
+    """Returns the PNG bytes and the color count if colors had to be reduced.
+
+    source is a path or a binary file object. Raises ValueError if the image
+    can't be made small enough.
+    """
     with Image.open(source) as original:
         image = ImageOps.exif_transpose(original).convert("RGBA")
 
@@ -34,7 +39,15 @@ def main(source, target):
         data = encode(image.quantize(colors=count, dither=Image.Dither.NONE))
 
     if len(data) > MAX_BYTES:
-        sys.exit(f"Could not get {source} under {MAX_BYTES} bytes")
+        raise ValueError(f"Could not get the image under {MAX_BYTES} bytes")
+    return data, colors
+
+
+def main(source, target):
+    try:
+        data, colors = convert(source)
+    except ValueError as error:
+        sys.exit(f"{source}: {error}")
 
     with open(target, "wb") as file:
         file.write(data)

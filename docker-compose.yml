@@ -1,0 +1,10 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+    environment:
+      PIXEL_DISPLAY_HOST: ${PIXEL_DISPLAY_HOST:-192.168.1.60}
+    ports:
+      - "${WEB_PORT:-8032}:8000"
+    restart: unless-stopped

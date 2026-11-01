@@ -82,6 +82,16 @@ curl -X POST http://pixel-display.local/send-raw -d "plain=0500040101"
 
 Only `/update` needs a password, so keep the board off untrusted networks.
 
+## Web UI
+
+A page to upload images, with automatic resizing and a preview, and to control the display. It runs in Docker and passes requests on to the board.
+
+```bash
+PIXEL_DISPLAY_HOST=192.168.1.60 docker compose up -d --build
+```
+
+Open port 8032 on that machine, set `WEB_PORT` to use another one. It has no login, so only run it on a network you trust. It restarts along with Docker, `docker compose down` removes it.
+
 ## Preparing images
 
 Converts any image to a PNG the display can show: crops to a centred square, resizes to 32x32 and reduces colors if needed to fit the size limit. It needs Docker, and the original is left alone.

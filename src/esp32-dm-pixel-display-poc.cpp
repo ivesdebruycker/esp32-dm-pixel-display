@@ -83,6 +83,7 @@ static volatile bool paired = false;
 static volatile bool restore_display = false;
 // Entering draw mode blanks the screen, so only do it when the display isn't in it yet
 static volatile bool draw_mode_active = false;
+static volatile bool show_upload = false;
 static SemaphoreHandle_t bleMutex;
 static BLEClient *pClient = nullptr;
 
@@ -783,9 +784,8 @@ void handlePngUpload()
     Serial.printf("Stored in slot %d\n", next_upload_slot);
     current_display_file = next_upload_slot;
     next_upload_slot = (next_upload_slot + 1) % max_files;
-    display_mode = MODE_SLIDESHOW;
     saveSettings();
-    last_display_change = 0; // show it right away
+    show_upload = true;
     upload_status = 200;
     upload_message = "File stored";
   }
@@ -969,8 +969,18 @@ void bleTask(void *parameter)
         }
       }
 
+      // show a new upload right away, the clock keeps running and only stores it
+      if (show_upload)
+      {
+        show_upload = false;
+        if (display_mode != MODE_CLOCK)
+        {
+          last_display_change = millis();
+          showNextImage();
+        }
+      }
       // change the display every 15 seconds
-      if (display_mode == MODE_SLIDESHOW && (last_display_change == 0 || millis() - last_display_change > 15000))
+      else if (display_mode == MODE_SLIDESHOW && (last_display_change == 0 || millis() - last_display_change > 15000))
       {
         last_display_change = millis();
         showNextImage();

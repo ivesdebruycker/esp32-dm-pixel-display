@@ -64,7 +64,7 @@ Replace `pixel-display.local` with the board's IP address if needed.
 | Method and path | Purpose |
 |---|---|
 | `GET /status` | Connection state, mode, image count, memory and storage |
-| `POST /send-png` | Store a PNG and show it, multipart field with a `.png` filename |
+| `POST /send-png` | Store a PNG and show it, multipart field with a `.png` filename. Doesn't change the mode, in clock mode it's only stored |
 | `POST /start-clock` | Show the clock, this stops the slideshow |
 | `POST /slideshow/start` | Cycle through stored images every 15 seconds |
 | `POST /slideshow/stop` | Stop cycling and leave the current content |

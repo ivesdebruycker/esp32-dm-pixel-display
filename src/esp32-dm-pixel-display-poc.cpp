@@ -10,6 +10,7 @@
 #include <ESPmDNS.h>
 #include <LittleFS.h>
 #include <Update.h>
+#include <esp_gattc_api.h>
 #include "Commands.h"
 #include "secrets.h"
 
@@ -57,6 +58,10 @@ static volatile bool draw_mode_active = false;
 static volatile bool show_upload = false;
 // BLE traffic slows down Wi-Fi a lot, so the slideshow waits during a firmware update
 static volatile bool ota_active = false;
+// Last time loop() ran. The web server waits without a time limit for the rest of an
+// upload, so a sender that disappears mid-upload on a weak signal freezes it.
+static volatile unsigned long loop_heartbeat = 0;
+const unsigned long loop_stuck_ms = 60000;
 static SemaphoreHandle_t bleMutex;
 static BLEClient *pClient = nullptr;
 
@@ -88,11 +93,20 @@ bool sendCommand(std::vector<uint8_t> data)
     // create chunk
     std::vector<uint8_t> chunk(data.begin() + i, data.begin() + std::min(i + mtu_size, data.size()));
 
-    // Without response: the write confirmation sometimes never arrives, and waiting for it
-    // blocked the web server for minutes. The display confirms images with a notification.
+    // Without response, and straight to the BLE stack: the library's writeValue waits for a
+    // write event even then, and that event sometimes never arrives, which blocked the web
+    // server for minutes. The display confirms images with a notification.
     // The pause keeps it from dropping packets, 10 ms or less wasn't reliable in testing.
-    writeCharacteristic->writeValue(chunk.data(), chunk.size(), false);
+    esp_err_t result = esp_ble_gattc_write_char(
+        pClient->getGattcIf(), pClient->getConnId(), writeCharacteristic->getHandle(),
+        chunk.size(), chunk.data(), ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NONE);
     vTaskDelay(pdMS_TO_TICKS(20));
+    if (result != ESP_OK)
+    {
+      Serial.printf("BLE write failed: %d\n", result);
+      sent = false;
+      break;
+    }
   }
   xSemaphoreGive(bleMutex);
 
@@ -742,6 +756,23 @@ void setupWebServer()
 
 void showNextImage();
 
+// Restarts the board when loop() is stuck, it reconnects and applies its saved settings again.
+// A firmware update keeps loop() busy for its whole upload, so it gets longer.
+void watchdogTask(void *parameter)
+{
+  for (;;)
+  {
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    unsigned long limit = ota_active ? 5 * loop_stuck_ms : loop_stuck_ms;
+    if (loop_heartbeat != 0 && millis() - loop_heartbeat > limit)
+    {
+      Serial.printf("Main loop stuck for %lu s, restarting\n", (millis() - loop_heartbeat) / 1000);
+      delay(200);
+      ESP.restart();
+    }
+  }
+}
+
 // Keeps the display connected and updated, separate from loop() so HTTP stays up in the meantime
 void bleTask(void *parameter)
 {
@@ -909,6 +940,7 @@ void setup()
   setupWebServer();
 
   xTaskCreate(bleTask, "ble", 8192, nullptr, 1, nullptr);
+  xTaskCreate(watchdogTask, "watchdog", 2048, nullptr, 1, nullptr);
 }
 
 bool mdns_started = false;
@@ -916,6 +948,7 @@ bool wifi_connected = false;
 
 void loop()
 {
+  loop_heartbeat = millis();
   server.handleClient();
 
   if (WiFi.status() == WL_CONNECTED && !wifi_connected)

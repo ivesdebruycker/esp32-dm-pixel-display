@@ -58,6 +58,10 @@ player = {
     "image_id": None,
     "next_change_at": None,
     "needs_slideshow_stop": False,
+    # paused by hand: holds on the current image, skipping still shows the chosen one
+    "paused": False,
+    # (generation, index) of the image on screen, so resuming doesn't send it again
+    "shown": None,
 }
 player_wake = asyncio.Event()
 
@@ -106,6 +110,10 @@ def init_storage():
         columns = [row["name"] for row in connection.execute("PRAGMA table_info(images)")]
         if "settings" not in columns:
             connection.execute("ALTER TABLE images ADD COLUMN settings TEXT")
+        # and players saved before pausing existed weren't paused
+        columns = [row["name"] for row in connection.execute("PRAGMA table_info(player_state)")]
+        if "paused" not in columns:
+            connection.execute("ALTER TABLE player_state ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
 
 
 async def board_request(method, path, timeout=30, still_wanted=None, **kwargs):
@@ -149,13 +157,14 @@ def save_player_state():
     playlist_id = player["playlist_id"] if player["active"] else None
     with db() as connection:
         connection.execute(
-            "INSERT INTO player_state (id, playlist_id, position) VALUES (1, ?, ?) "
-            "ON CONFLICT (id) DO UPDATE SET playlist_id = excluded.playlist_id, position = excluded.position",
-            (playlist_id, player["index"]),
+            "INSERT INTO player_state (id, playlist_id, position, paused) VALUES (1, ?, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET playlist_id = excluded.playlist_id, "
+            "position = excluded.position, paused = excluded.paused",
+            (playlist_id, player["index"], int(player["paused"])),
         )
 
 
-def start_player(playlist_id, index=0):
+def start_player(playlist_id, index=0, paused=False):
     player.update(
         active=True,
         generation=player["generation"] + 1,
@@ -166,6 +175,8 @@ def start_player(playlist_id, index=0):
         image_id=None,
         next_change_at=None,
         needs_slideshow_stop=True,
+        paused=paused,
+        shown=None,
     )
     save_player_state()
     player_wake.set()
@@ -179,6 +190,7 @@ def stop_player(message=""):
         message=message,
         image_id=None,
         next_change_at=None,
+        paused=False,
     )
     save_player_state()
     player_wake.set()
@@ -220,53 +232,67 @@ async def play_next():
     index = player["index"] % len(items)
     item = items[index]
     player.update(index=index, image_id=item["image_id"])
+    already_shown = player["shown"] == (generation, index)
+
+    # paused by hand, hold until resumed or skipped
+    if player["paused"] and already_shown:
+        player.update(state="paused", message="", next_change_at=None)
+        await wait_for_wake(3600)
+        return
 
     # an image turns the screen back on, so wait while it's off and keep the place
     board = status["data"]
-    if board and board.get("screen_on") is False:
-        player.update(state="paused", message="The screen is off", next_change_at=None)
+    if board and board.get("screen_on") is False and not already_shown:
+        player.update(state="screen_off", message="The screen is off", next_change_at=None)
         await wait_for_wake(RETRY_SECONDS)
         return
 
-    try:
-        if player["needs_slideshow_stop"]:
-            await board_request("POST", "/slideshow/stop", still_wanted=still_wanted)
-            player["needs_slideshow_stop"] = False
-        data = (IMAGE_DIR / f"{item['image_id']}.png").read_bytes()
-        await board_request(
-            "POST",
-            "/show-png",
-            still_wanted=still_wanted,
-            files={"file": ("image.png", data, "image/png")},
-        )
-    except PlayerStopped:
-        return
-    except HTTPException as error:
+    # after resuming, the image is still on screen and only gets its time again
+    if not already_shown:
+        try:
+            if player["needs_slideshow_stop"]:
+                await board_request("POST", "/slideshow/stop", still_wanted=still_wanted)
+                player["needs_slideshow_stop"] = False
+            data = (IMAGE_DIR / f"{item['image_id']}.png").read_bytes()
+            await board_request(
+                "POST",
+                "/show-png",
+                still_wanted=still_wanted,
+                files={"file": ("image.png", data, "image/png")},
+            )
+        except PlayerStopped:
+            return
+        except HTTPException as error:
+            if not still_wanted():
+                return
+            player.update(state="waiting", message=str(error.detail), next_change_at=None)
+            await wait_for_wake(RETRY_SECONDS)
+            # the same image is retried, unless the board rejected this image itself
+            if still_wanted() and error.status_code not in RETRY_STATUS_CODES:
+                player["index"] = index + 1
+            return
+        except OSError as error:
+            log.error("Could not read image %s: %s", item["image_id"], error)
+            player.update(state="waiting", message=f"Could not read {item['name']}", next_change_at=None)
+            await wait_for_wake(RETRY_SECONDS)
+            if still_wanted():
+                player["index"] = index + 1
+            return
+
+        # it can have been stopped or restarted during the send
         if not still_wanted():
             return
-        player.update(state="waiting", message=str(error.detail), next_change_at=None)
-        await wait_for_wake(RETRY_SECONDS)
-        # the same image is retried, unless the board rejected this image itself
-        if still_wanted() and error.status_code not in RETRY_STATUS_CODES:
-            player["index"] = index + 1
-        return
-    except OSError as error:
-        log.error("Could not read image %s: %s", item["image_id"], error)
-        player.update(state="waiting", message=f"Could not read {item['name']}", next_change_at=None)
-        await wait_for_wake(RETRY_SECONDS)
-        if still_wanted():
-            player["index"] = index + 1
+        player["shown"] = (generation, index)
+
+    if player["paused"]:
         return
 
-    # it can have been stopped or restarted during the send
-    if not still_wanted():
-        return
-
-    # each image's time starts once it has been sent
+    # each image's time starts once it has been sent, or resumed
     player.update(state="playing", message="", next_change_at=time.time() + item["duration"])
     save_player_state()
     await wait_for_wake(item["duration"])
-    if still_wanted():
+    # pausing during the wait keeps this image
+    if still_wanted() and not player["paused"]:
         player["index"] = index + 1
 
 
@@ -287,11 +313,11 @@ async def run_player():
 def resume_player():
     with db() as connection:
         row = connection.execute(
-            "SELECT state.playlist_id, state.position FROM player_state state "
+            "SELECT state.playlist_id, state.position, state.paused FROM player_state state "
             "JOIN playlists ON playlists.id = state.playlist_id"
         ).fetchone()
     if row:
-        start_player(row["playlist_id"], row["position"])
+        start_player(row["playlist_id"], row["position"], bool(row["paused"]))
 
 
 @asynccontextmanager
@@ -692,6 +718,26 @@ async def player_step(body: PlayerStep):
     return skip_to((player["index"] + body.direction) % len(items), items)
 
 
+@app.post("/api/player/pause")
+async def player_pause():
+    if not player["active"]:
+        raise HTTPException(409, "No playlist is playing")
+    player.update(paused=True)
+    save_player_state()
+    player_wake.set()
+    return {"message": "Paused, use previous and next to change the image"}
+
+
+@app.post("/api/player/resume")
+async def player_resume():
+    if not player["active"]:
+        raise HTTPException(409, "No playlist is playing")
+    player.update(paused=False)
+    save_player_state()
+    player_wake.set()
+    return {"message": "Resumed"}
+
+
 @app.post("/api/player/stop")
 async def player_stop():
     stop_player()
@@ -701,6 +747,7 @@ async def player_stop():
 def player_status():
     result = {
         "active": player["active"],
+        "paused": player["active"] and player["paused"],
         "state": player["state"],
         "message": player["message"],
         "playlist_id": player["playlist_id"] if player["active"] else None,

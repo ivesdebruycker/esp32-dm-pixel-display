@@ -211,6 +211,7 @@
       <button id="play" class="primary" type="button">Play</button>
       <button id="stop-playlist" type="button">Stop</button>
       <button id="previous" class="icon" type="button" aria-label="Previous image">◀</button>
+      <button id="pause-toggle" type="button">Pause</button>
       <button id="next" class="icon" type="button" aria-label="Next image">▶</button>
       <span class="spacer"></span>
       <button id="new-playlist" type="button">New</button>
@@ -536,8 +537,12 @@ function showPlayer(state) {
   } else if (state.state === "waiting") {
     text.textContent = `${state.playlist_name}: waiting, retrying soon. ${state.message}`;
     text.className = "muted waiting";
-  } else if (state.state === "paused") {
+  } else if (state.state === "screen_off") {
     text.textContent = `${state.playlist_name}: paused while the screen is off, it continues when you turn it on`;
+    text.className = "muted waiting";
+  } else if (state.paused) {
+    const image = state.image_name ? `${state.image_name} (${state.position} of ${state.count})` : "the current image";
+    text.textContent = `${state.playlist_name}: paused on ${image}`;
     text.className = "muted waiting";
   } else {
     const left = state.seconds_left === null ? "" : `, next in ${formatDuration(state.seconds_left)}`;
@@ -598,8 +603,12 @@ function updatePlaylistButtons() {
   $("rename-playlist").disabled = busy || !playlist;
   $("delete-playlist").disabled = busy || !playlist;
   const playing = Boolean(currentPlayer && currentPlayer.active);
+  const paused = Boolean(playing && currentPlayer.paused);
   $("previous").disabled = busy || !playing;
   $("next").disabled = busy || !playing;
+  $("pause-toggle").disabled = busy || !playing;
+  $("pause-toggle").textContent = paused ? "Resume" : "Pause";
+  $("pause-toggle").setAttribute("aria-pressed", paused);
 }
 
 function markCurrentItem() {
@@ -947,6 +956,13 @@ $("stop-playlist").addEventListener("click", () => run("Stopping the playlist…
   const response = await requestWithMethod("/api/player/stop", "POST");
   return (await response.json()).message;
 }));
+$("pause-toggle").addEventListener("click", () => {
+  const resume = Boolean(currentPlayer && currentPlayer.paused);
+  run(resume ? "Resuming…" : "Pausing…", async () => {
+    const response = await requestWithMethod(resume ? "/api/player/resume" : "/api/player/pause", "POST");
+    return (await response.json()).message;
+  });
+});
 [["previous", -1], ["next", 1]].forEach(([id, direction]) => $(id).addEventListener("click", () => {
   run(direction < 0 ? "Going to the previous image…" : "Going to the next image…", async () => {
     return (await sendJson("/api/player/step", "POST", { direction })).message;

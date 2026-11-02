@@ -75,7 +75,8 @@ bool sendCommand(std::vector<uint8_t> data)
   xSemaphoreTake(bleMutex, portMAX_DELAY);
   bool sent = true;
   unsigned long send_start = millis();
-  int mtu_size = 509;
+  // a write without response has to fit in one packet
+  size_t mtu_size = pClient != nullptr ? std::min<size_t>(509, pClient->getMTU() - 3) : 20;
   for (size_t i = 0; i < data.size(); i += mtu_size)
   {
     if (!paired || writeCharacteristic == nullptr)
@@ -87,8 +88,11 @@ bool sendCommand(std::vector<uint8_t> data)
     // create chunk
     std::vector<uint8_t> chunk(data.begin() + i, data.begin() + std::min(i + mtu_size, data.size()));
 
-    // write to GATT characteristic
-    writeCharacteristic->writeValue(chunk.data(), chunk.size(), true);
+    // Without response: the write confirmation sometimes never arrives, and waiting for it
+    // blocked the web server for minutes. The display confirms images with a notification.
+    // The pause keeps it from dropping packets, 10 ms or less wasn't reliable in testing.
+    writeCharacteristic->writeValue(chunk.data(), chunk.size(), false);
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
   xSemaphoreGive(bleMutex);
 
@@ -502,10 +506,21 @@ void handleShowPngUpload()
   receivePng();
 }
 
+// Showing something on purpose turns the screen back on, so it's never shown to a dark screen
+void wakeScreen()
+{
+  if (!screen_on && sendCommand(commands.on()))
+  {
+    screen_on = true;
+    saveSettings();
+  }
+}
+
 void handleShowPngDone()
 {
   if (upload_status == 200)
   {
+    wakeScreen();
     // the clock won't be on screen anymore
     if (display_mode == MODE_CLOCK)
     {
@@ -527,6 +542,7 @@ void handleStartClock()
 {
   setDisplayMode(MODE_CLOCK);
   draw_mode_active = false;
+  wakeScreen();
   if (sendCommand(commands.clock(3, true, true, 100, 100, 180)))
   {
     server.send(200, "text/plain", "Clock started");
@@ -541,6 +557,7 @@ void handleStartSlideshow()
 {
   setDisplayMode(MODE_SLIDESHOW);
   last_display_change = 0;
+  wakeScreen();
   server.send(200, "text/plain", "Slideshow started");
 }
 
@@ -755,13 +772,14 @@ void bleTask(void *parameter)
         {
           sendCommand(commands.setBrightness(brightness_pct));
         }
-        if (!screen_on)
-        {
-          sendCommand(commands.off());
-        }
         if (display_mode == MODE_CLOCK)
         {
           sendCommand(commands.clock(3, true, true, 100, 100, 180));
+        }
+        // last, in case showing the clock turns the screen on
+        if (!screen_on)
+        {
+          sendCommand(commands.off());
         }
       }
 
@@ -771,18 +789,19 @@ void bleTask(void *parameter)
         continue;
       }
 
-      // show a new upload right away, the clock keeps running and only stores it
+      // show a new upload right away, the clock keeps running and only stores it.
+      // An image turns the screen back on, so nothing is shown while it's off
       if (show_upload)
       {
         show_upload = false;
-        if (display_mode != MODE_CLOCK)
+        if (display_mode != MODE_CLOCK && screen_on)
         {
           last_display_change = millis();
           showNextImage();
         }
       }
       // change the display every 15 seconds
-      else if (display_mode == MODE_SLIDESHOW && (last_display_change == 0 || millis() - last_display_change > 15000))
+      else if (display_mode == MODE_SLIDESHOW && screen_on && (last_display_change == 0 || millis() - last_display_change > 15000))
       {
         last_display_change = millis();
         showNextImage();

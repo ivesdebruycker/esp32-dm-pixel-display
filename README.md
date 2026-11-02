@@ -26,7 +26,7 @@ Web UI:
 - Crop position and zoom, or fit with coloured bars
 - Contrast, saturation and pixel-art resizing
 - An image library, including adding many images at once
-- Named playlists with a duration per image, and click an image to skip to it
+- Named playlists with a duration per image, previous and next buttons, and click an image to skip to it. Playlists pause while the screen is off
 - Brightness, screen, clock and slideshow controls
 
 ## Hardware
@@ -85,7 +85,7 @@ Replace `pixel-display.local` with the board's IP address if needed.
 | `POST /send-png` | Store a PNG and show it, multipart field with a `.png` filename. Doesn't change the mode, in clock mode it's only stored |
 | `POST /show-png` | Show a PNG without storing it, same upload and limits. A running slideshow continues after 15 seconds, and the clock stops |
 | `POST /brightness` | Set brightness with `value` from 5 to 100, kept across restarts |
-| `POST /screen` | Turn the screen on or off with `on` as 1 or 0, kept across restarts |
+| `POST /screen` | Turn the screen on or off with `on` as 1 or 0, kept across restarts. While it's off the slideshow pauses and uploads are only stored, showing an image or the clock turns it back on |
 | `POST /start-clock` | Show the clock, this stops the slideshow |
 | `POST /slideshow/start` | Cycle through stored images every 15 seconds |
 | `POST /slideshow/stop` | Stop cycling and leave the current content |

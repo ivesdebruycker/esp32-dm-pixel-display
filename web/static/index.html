@@ -210,6 +210,8 @@
       </label>
       <button id="play" class="primary" type="button">Play</button>
       <button id="stop-playlist" type="button">Stop</button>
+      <button id="previous" class="icon" type="button" aria-label="Previous image">◀</button>
+      <button id="next" class="icon" type="button" aria-label="Next image">▶</button>
       <span class="spacer"></span>
       <button id="new-playlist" type="button">New</button>
       <button id="rename-playlist" type="button">Rename</button>
@@ -534,6 +536,9 @@ function showPlayer(state) {
   } else if (state.state === "waiting") {
     text.textContent = `${state.playlist_name}: waiting, retrying soon. ${state.message}`;
     text.className = "muted waiting";
+  } else if (state.state === "paused") {
+    text.textContent = `${state.playlist_name}: paused while the screen is off, it continues when you turn it on`;
+    text.className = "muted waiting";
   } else {
     const left = state.seconds_left === null ? "" : `, next in ${formatDuration(state.seconds_left)}`;
     const image = state.image_name ? `${state.image_name} (${state.position} of ${state.count})` : "starting";
@@ -541,6 +546,7 @@ function showPlayer(state) {
     text.className = "muted active";
   }
   markCurrentItem();
+  updatePlaylistButtons();
 }
 
 function formatDuration(seconds) {
@@ -591,6 +597,9 @@ function updatePlaylistButtons() {
   $("play").disabled = busy || !playlist || playlist.items.length === 0;
   $("rename-playlist").disabled = busy || !playlist;
   $("delete-playlist").disabled = busy || !playlist;
+  const playing = Boolean(currentPlayer && currentPlayer.active);
+  $("previous").disabled = busy || !playing;
+  $("next").disabled = busy || !playing;
 }
 
 function markCurrentItem() {
@@ -937,6 +946,11 @@ $("play").addEventListener("click", () => {
 $("stop-playlist").addEventListener("click", () => run("Stopping the playlist…", async () => {
   const response = await requestWithMethod("/api/player/stop", "POST");
   return (await response.json()).message;
+}));
+[["previous", -1], ["next", 1]].forEach(([id, direction]) => $(id).addEventListener("click", () => {
+  run(direction < 0 ? "Going to the previous image…" : "Going to the next image…", async () => {
+    return (await sendJson("/api/player/step", "POST", { direction })).message;
+  });
 }));
 
 async function start() {

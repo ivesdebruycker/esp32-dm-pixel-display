@@ -221,6 +221,13 @@ async def play_next():
     item = items[index]
     player.update(index=index, image_id=item["image_id"])
 
+    # an image turns the screen back on, so wait while it's off and keep the place
+    board = status["data"]
+    if board and board.get("screen_on") is False:
+        player.update(state="paused", message="The screen is off", next_change_at=None)
+        await wait_for_wake(RETRY_SECONDS)
+        return
+
     try:
         if player["needs_slideshow_stop"]:
             await board_request("POST", "/slideshow/stop", still_wanted=still_wanted)
@@ -647,6 +654,19 @@ class PlayerSkip(BaseModel):
     position: int = Field(ge=0)
 
 
+def skip_to(position, items):
+    player.update(
+        generation=player["generation"] + 1,
+        index=position,
+        state="starting",
+        message="",
+        next_change_at=None,
+    )
+    save_player_state()
+    player_wake.set()
+    return {"message": f"Skipped to {items[position]['name']}"}
+
+
 @app.post("/api/player/skip")
 async def player_skip(body: PlayerSkip):
     if not player["active"] or player["playlist_id"] != body.playlist_id:
@@ -654,17 +674,22 @@ async def player_skip(body: PlayerSkip):
     items = playlist_items(body.playlist_id)
     if body.position >= len(items):
         raise HTTPException(400, "This image is no longer in the playlist")
+    return skip_to(body.position, items)
 
-    player.update(
-        generation=player["generation"] + 1,
-        index=body.position,
-        state="starting",
-        message="",
-        next_change_at=None,
-    )
-    save_player_state()
-    player_wake.set()
-    return {"message": f"Skipped to {items[body.position]['name']}"}
+
+class PlayerStep(BaseModel):
+    direction: Literal[-1, 1]
+
+
+@app.post("/api/player/step")
+async def player_step(body: PlayerStep):
+    """Goes to the previous or next image of the playing playlist, wrapping around."""
+    if not player["active"]:
+        raise HTTPException(409, "No playlist is playing")
+    items = playlist_items(player["playlist_id"])
+    if not items:
+        raise HTTPException(400, "The playlist has no images")
+    return skip_to((player["index"] + body.direction) % len(items), items)
 
 
 @app.post("/api/player/stop")

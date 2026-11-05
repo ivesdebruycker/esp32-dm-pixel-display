@@ -16,8 +16,18 @@
 
 static Commands commands;
 
-const char *ssid = WIFI_SSID;
-const char *password = WIFI_PASSWORD;
+// {ssid, password}, tried in turn until one connects
+const char *networks[][2] = {
+    {WIFI_SSID, WIFI_PASSWORD},
+#ifdef WIFI_FALLBACK_SSID
+    {WIFI_FALLBACK_SSID, WIFI_FALLBACK_PASSWORD},
+#endif
+};
+const int network_count = sizeof(networks) / sizeof(networks[0]);
+int current_network = 0;
+// How long to try one network before moving on to the next
+const unsigned long wifi_attempt_ms = 20000;
+unsigned long wifi_attempt_start = 0;
 const char *hostname = "pixel-display";
 const char *displayAddress = DISPLAY_ADDRESS;
 
@@ -651,7 +661,9 @@ void handleStatus()
   json += LittleFS.totalBytes();
   json += ",\"free_heap\":";
   json += ESP.getFreeHeap();
-  json += ",\"wifi_rssi\":";
+  json += ",\"wifi_ssid\":\"";
+  json += WiFi.SSID();
+  json += "\",\"wifi_rssi\":";
   json += WiFi.RSSI();
   json += ",\"ip\":\"";
   json += WiFi.localIP().toString();
@@ -721,6 +733,17 @@ void handleUpdateDone()
   ESP.restart();
 }
 
+void connectWiFi(int index)
+{
+  current_network = index;
+  wifi_attempt_start = millis();
+  WiFi.disconnect();
+  WiFi.begin(networks[index][0], networks[index][1]);
+  Serial.print("Connecting to ");
+  Serial.print(networks[index][0]);
+  Serial.println(" ...");
+}
+
 void setupWebServer()
 {
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info)
@@ -732,10 +755,7 @@ void setupWebServer()
   // by default it joins the first access point found, not the strongest
   WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
   WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
-  WiFi.begin(ssid, password); // Connect to the network
-  Serial.print("Connecting to ");
-  Serial.print(ssid);
-  Serial.println(" ...");
+  connectWiFi(0);
 
   const char *collected_headers[] = {"Content-Type"};
   server.collectHeaders(collected_headers, 1);
@@ -964,7 +984,17 @@ void loop()
   }
   else if (WiFi.status() != WL_CONNECTED)
   {
-    wifi_connected = false;
+    if (wifi_connected)
+    {
+      // give auto reconnect a full attempt before switching networks
+      wifi_connected = false;
+      wifi_attempt_start = millis();
+    }
+    // auto reconnect gives up when the first connect fails, so retry here
+    else if (millis() - wifi_attempt_start > wifi_attempt_ms)
+    {
+      connectWiFi((current_network + 1) % network_count);
+    }
   }
 
   delay(2);

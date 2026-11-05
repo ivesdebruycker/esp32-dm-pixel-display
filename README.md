@@ -39,6 +39,8 @@ Web UI:
 
 Copy `include/secrets.example.h` to `include/secrets.h` and fill it in. `secrets.h` is gitignored. You can find your display's Bluetooth address with any BLE scanner app.
 
+Set `WIFI_FALLBACK_SSID` and `WIFI_FALLBACK_PASSWORD` to add a second network. The board tries each network for 20 seconds in turn until one connects, and after losing the connection it tries the same network again before moving on. `GET /status` shows which network it's on as `wifi_ssid`.
+
 ## Build
 
 Needs Docker and nothing else. The toolchain stays in the `pio-cache` and `pio-venv` Docker volumes.

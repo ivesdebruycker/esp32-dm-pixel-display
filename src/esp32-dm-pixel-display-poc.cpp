@@ -739,6 +739,9 @@ void connectWiFi(int index)
   wifi_attempt_start = millis();
   WiFi.disconnect();
   WiFi.begin(networks[index][0], networks[index][1]);
+  // Some ESP32-C3 boards fail to authenticate at full transmit power,
+  // connecting reliably once it's lowered
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);
   Serial.print("Connecting to ");
   Serial.print(networks[index][0]);
   Serial.println(" ...");

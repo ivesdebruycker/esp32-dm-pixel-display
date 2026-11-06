@@ -44,6 +44,8 @@ static BLEUUID writeCharUUID("0000fa02-0000-1000-8000-00805f9b34fb");
 const int max_files = 10;
 // Largest size seen working, a 4196 byte PNG sent as two chunks isn't shown
 const size_t max_png_size = 3663;
+// Largest GIF seen playing, at 12005 bytes the display shows only the first frame
+const size_t max_gif_size = 11318;
 int next_upload_slot = 0;
 int current_display_file = 0;
 
@@ -236,7 +238,7 @@ std::vector<std::vector<uint8_t>> splitIntoChunks(const std::vector<uint8_t> &da
   return chunks;
 }
 
-// Function to create payloads from GIF data, not used yet
+// Function to create payloads from GIF data
 std::vector<std::vector<uint8_t>>
 createPayloads(const std::vector<uint8_t> &gif_data)
 { // Calculate CRC32
@@ -257,7 +259,8 @@ createPayloads(const std::vector<uint8_t> &gif_data)
           255, 255, 1, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 5, 0, 13};
 
   // Set length and CRC in header
-  uint32_t totalLength = gif_data.size() + header.size();
+  // only the GIF itself, counting the header breaks GIFs sent in more than one chunk
+  uint32_t totalLength = gif_data.size();
   Serial.print("data + header: ");
   Serial.println(totalLength);
   printf("(%02X) \n", totalLength);
@@ -562,6 +565,82 @@ void handleShowPngDone()
   handlePngDone();
 }
 
+// Collects and checks an uploaded GIF, returns true once it's complete and valid
+bool receiveGif()
+{
+  if (!isMultipartUpload())
+  {
+    return false;
+  }
+
+  HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    Serial.printf("Upload file start: %s\n", upload.filename.c_str());
+    png_data.clear();
+    upload_status = upload.filename.endsWith(".gif") ? 0 : 400;
+    upload_message = "File must be a GIF";
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE && upload_status == 0)
+  {
+    if (png_data.size() + upload.currentSize > max_gif_size)
+    {
+      png_data.clear();
+      upload_status = 413;
+      upload_message = "File too large";
+      return false;
+    }
+    png_data.insert(png_data.end(), upload.buf, upload.buf + upload.currentSize);
+  }
+  else if (upload.status == UPLOAD_FILE_END && upload_status == 0)
+  {
+    Serial.printf("Upload file end: %d bytes\n", png_data.size());
+    if (png_data.size() < 6 || memcmp(png_data.data(), "GIF8", 4) != 0)
+    {
+      upload_status = 400;
+      upload_message = "File must be a GIF";
+      return false;
+    }
+
+    upload_status = 200;
+    return true;
+  }
+  return false;
+}
+
+void handleShowGifUpload()
+{
+  receiveGif();
+}
+
+// Shows an uploaded animated GIF without storing it, the display plays it by itself
+void handleShowGifDone()
+{
+  if (upload_status == 200)
+  {
+    wakeScreen();
+    if (display_mode == MODE_CLOCK)
+    {
+      setDisplayMode(MODE_IDLE);
+    }
+    last_display_change = millis();
+    bool sent = true;
+    std::vector<std::vector<uint8_t>> payloads = createPayloads(png_data);
+    for (size_t i = 0; i < payloads.size() && sent; i++)
+    {
+      sent = sendCommand(payloads[i]);
+      // the display needs time to take in a chunk. At 100 ms, or right after its reply,
+      // the GIF shows only the first frame, 1 second worked every time
+      vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    // a GIF leaves draw mode, so the next PNG enters it again
+    draw_mode_active = false;
+    upload_status = sent ? 200 : 503;
+    upload_message = sent ? "GIF sent" : "Display not connected";
+  }
+  handlePngDone();
+}
+
 void handleStartClock()
 {
   setDisplayMode(MODE_CLOCK);
@@ -766,6 +845,7 @@ void setupWebServer()
   server.on("/send-raw", HTTP_POST, handlePost);
   server.on("/send-png", HTTP_POST, handlePngDone, handlePngUpload);
   server.on("/show-png", HTTP_POST, handleShowPngDone, handleShowPngUpload);
+  server.on("/show-gif", HTTP_POST, handleShowGifDone, handleShowGifUpload);
   server.on("/start-clock", HTTP_POST, handleStartClock);
   server.on("/slideshow/start", HTTP_POST, handleStartSlideshow);
   server.on("/slideshow/stop", HTTP_POST, handleStopSlideshow);

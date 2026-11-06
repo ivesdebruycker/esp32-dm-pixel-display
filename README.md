@@ -86,6 +86,7 @@ Replace `pixel-display.local` with the board's IP address if needed.
 | `GET /status` | Connection state, mode, brightness, screen, image count, memory and storage |
 | `POST /send-png` | Store a PNG and show it, multipart field with a `.png` filename. Doesn't change the mode, in clock mode it's only stored |
 | `POST /show-png` | Show a PNG without storing it, same upload and limits. A running slideshow continues after 15 seconds, and the clock stops |
+| `POST /show-gif` | Play an animated 32x32 GIF without storing it on the board, multipart field with a `.gif` filename, up to 11318 bytes. Like `/show-png` for the slideshow and clock |
 | `POST /brightness` | Set brightness with `value` from 5 to 100, kept across restarts |
 | `POST /screen` | Turn the screen on or off with `on` as 1 or 0, kept across restarts. While it's off the slideshow pauses and uploads are only stored, showing an image or the clock turns it back on |
 | `POST /start-clock` | Show the clock, this stops the slideshow |
@@ -104,11 +105,13 @@ curl -X POST http://pixel-display.local/send-raw -d "plain=0500040101"
 
 Only `/update` needs a password, so keep the board off untrusted networks.
 
+The display keeps every GIF it receives and plays its own copy when it gets the same file again, even if that copy arrived broken. If a GIF stays on its first frame, change any byte and send it again. The web UI adds a random comment to each GIF it sends for this reason.
+
 ## Web UI
 
 A page to upload and adjust images, keep an image library and playlists, and control the display. It runs in Docker and passes requests on to the board.
 
-Library images keep their originals, so **Adjust** can change the crop or colours later. Playlists have a duration per image (at least 5 seconds) and aren't limited to the board's 10 slots, because the server sends images one at a time and keeps the library in a Docker volume. They resume when the container restarts. When the server is off, the last image stays on screen until the board is told otherwise.
+Library images keep their originals, so **Adjust** can change the crop or colours later. Animated GIFs stay animated with their own timing, using fewer colours and then fewer frames to fit the size limit. Turn off **Animate** to use the first frame instead, which **Save to board** needs because the board's slideshow only stores still images. Playlists have a duration per image (at least 5 seconds) and aren't limited to the board's 10 slots, because the server sends images one at a time and keeps the library in a Docker volume. They resume when the container restarts. When the server is off, the last image stays on screen until the board is told otherwise.
 
 ```bash
 cp .env.example .env    # then set the board's address in .env
@@ -119,7 +122,7 @@ Open port 8032 on that machine, set `WEB_PORT` to use another one. It has no log
 
 ## Preparing images
 
-For the command line, without the web UI. This converts any image to a PNG the display can show: crops to a centred square, resizes to 32x32 and reduces colors if needed to fit the size limit. It needs Docker, and the original is left alone.
+For the command line, without the web UI. This converts any image to a PNG the display can show, using the first frame of an animation: crops to a centred square, resizes to 32x32 and reduces colors if needed to fit the size limit. It needs Docker, and the original is left alone.
 
 ```bash
 scripts/prepare-image.sh photo.jpg

@@ -18,7 +18,7 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from prepare_image import MAX_BYTES, SIZE, convert
+from prepare_image import MAX_BYTES, MAX_GIF_BYTES, SIZE, convert, unique_gif
 
 BOARD_URL = f"http://{os.environ.get('PIXEL_DISPLAY_HOST', 'pixel-display.local')}"
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
@@ -28,6 +28,8 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_ZOOM = 8
 MAX_ENHANCE = 2
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+GIF_SIGNATURES = (b"GIF87a", b"GIF89a")
+MEDIA_TYPES = {"png": "image/png", "gif": "image/gif"}
 STATUS_INTERVAL = 10
 # one failed check can just be a slow moment on a weak Wi-Fi signal
 OFFLINE_AFTER_FAILURES = 2
@@ -114,6 +116,10 @@ def init_storage():
         columns = [row["name"] for row in connection.execute("PRAGMA table_info(player_state)")]
         if "paused" not in columns:
             connection.execute("ALTER TABLE player_state ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        # and images added before animations existed are all PNGs
+        columns = [row["name"] for row in connection.execute("PRAGMA table_info(images)")]
+        if "format" not in columns:
+            connection.execute("ALTER TABLE images ADD COLUMN format TEXT NOT NULL DEFAULT 'png'")
 
 
 async def board_request(method, path, timeout=30, still_wanted=None, **kwargs):
@@ -133,6 +139,19 @@ async def board_request(method, path, timeout=30, still_wanted=None, **kwargs):
     if response.status_code >= 400:
         raise HTTPException(response.status_code, response.text or "The board returned an error")
     return response
+
+
+def is_gif(data):
+    return data.startswith(GIF_SIGNATURES)
+
+
+async def show_on_display(data, still_wanted=None):
+    """Shows a PNG or an animated GIF without storing it on the board."""
+    if is_gif(data):
+        path, file = "/show-gif", ("image.gif", unique_gif(data), "image/gif")
+    else:
+        path, file = "/show-png", ("image.png", data, "image/png")
+    return await board_request("POST", path, still_wanted=still_wanted, files={"file": file})
 
 
 async def refresh_status():
@@ -208,7 +227,7 @@ async def wait_for_wake(seconds):
 def playlist_items(playlist_id):
     with db() as connection:
         return connection.execute(
-            "SELECT items.image_id, items.duration, images.name FROM playlist_items items "
+            "SELECT items.image_id, items.duration, images.name, images.format FROM playlist_items items "
             "JOIN images ON images.id = items.image_id "
             "WHERE items.playlist_id = ? ORDER BY items.position",
             (playlist_id,),
@@ -253,13 +272,8 @@ async def play_next():
             if player["needs_slideshow_stop"]:
                 await board_request("POST", "/slideshow/stop", still_wanted=still_wanted)
                 player["needs_slideshow_stop"] = False
-            data = (IMAGE_DIR / f"{item['image_id']}.png").read_bytes()
-            await board_request(
-                "POST",
-                "/show-png",
-                still_wanted=still_wanted,
-                files={"file": ("image.png", data, "image/png")},
-            )
+            data = image_path(item["image_id"], item["format"]).read_bytes()
+            await show_on_display(data, still_wanted=still_wanted)
         except PlayerStopped:
             return
         except HTTPException as error:
@@ -354,8 +368,10 @@ def adjustments(
     contrast: float = Form(1, ge=0, le=MAX_ENHANCE),
     saturation: float = Form(1, ge=0, le=MAX_ENHANCE),
     resize: Literal["smooth", "pixel"] = Form("smooth"),
+    animate: bool = Form(True),
 ):
     return {
+        "animate": animate,
         "mode": mode,
         "zoom": zoom,
         "x": x,
@@ -370,7 +386,7 @@ def adjustments(
 def inspect_and_convert(data, settings):
     with Image.open(io.BytesIO(data)) as image:
         original_size = ImageOps.exif_transpose(image).size
-    return (*convert(io.BytesIO(data), **settings), original_size)
+    return convert(io.BytesIO(data), **settings), original_size
 
 
 async def convert_upload(data, settings):
@@ -385,37 +401,46 @@ async def convert_upload(data, settings):
 @app.post("/api/convert")
 async def convert_image(file: UploadFile = File(...), settings: dict = Depends(adjustments)):
     data = await read_upload(file, MAX_UPLOAD_BYTES)
-    png, colors, original_size = await convert_upload(data, settings)
+    result, original_size = await convert_upload(data, settings)
     return Response(
-        png,
-        media_type="image/png",
+        result.data,
+        media_type=MEDIA_TYPES["gif" if result.is_gif else "png"],
         headers={
             "Cache-Control": "no-store",
-            "X-Image-Bytes": str(len(png)),
-            "X-Image-Colors": str(colors or ""),
+            "X-Image-Bytes": str(len(result.data)),
+            "X-Image-Colors": str(result.colors or ""),
+            "X-Image-Frames": str(result.frames or ""),
+            "X-Source-Frames": str(result.source_frames),
             "X-Original-Size": f"{original_size[0]}x{original_size[1]}",
         },
     )
 
 
-async def send_png(path, file):
-    data = await read_upload(file, MAX_BYTES)
-    if not data.startswith(PNG_SIGNATURE):
-        raise HTTPException(400, "File must be a PNG")
-    response = await board_request("POST", path, files={"file": ("image.png", data, "image/png")})
+@app.post("/api/show")
+async def show(file: UploadFile = File(...)):
+    data = await read_upload(file, max(MAX_BYTES, MAX_GIF_BYTES))
+    if is_gif(data):
+        if len(data) > MAX_GIF_BYTES:
+            raise HTTPException(413, "File too large")
+    elif not data.startswith(PNG_SIGNATURE) or len(data) > MAX_BYTES:
+        raise HTTPException(400, f"File must be a PNG of up to {MAX_BYTES} bytes, or a GIF")
+    stop_player()
+    response = await show_on_display(data)
     await refresh_status()
     return {"message": response.text}
 
 
-@app.post("/api/show")
-async def show(file: UploadFile = File(...)):
-    stop_player()
-    return await send_png("/show-png", file)
-
-
 @app.post("/api/save")
 async def save(file: UploadFile = File(...)):
-    return await send_png("/send-png", file)
+    """Stores a PNG on the board for its slideshow, which can't play animations."""
+    data = await read_upload(file, max(MAX_BYTES, MAX_GIF_BYTES))
+    if not data.startswith(PNG_SIGNATURE):
+        raise HTTPException(400, "Only still images can be saved to the board")
+    if len(data) > MAX_BYTES:
+        raise HTTPException(413, "File too large")
+    response = await board_request("POST", "/send-png", files={"file": ("image.png", data, "image/png")})
+    await refresh_status()
+    return {"message": response.text}
 
 
 async def command(path):
@@ -475,8 +500,28 @@ def image_row_to_dict(row):
         "bytes": row["bytes"],
         "used_in": row["used_in"],
         "settings": json.loads(row["settings"]) if row["settings"] else None,
-        "url": f"/api/library/{row['id']}.png",
+        "format": row["format"],
+        "url": f"/api/library/{row['id']}.{row['format']}",
     }
+
+
+def image_path(image_id, image_format):
+    return IMAGE_DIR / f"{image_id}.{image_format}"
+
+
+def store_converted(image_id, result):
+    """Writes the converted image and returns its format, replacing one in the other format."""
+    image_format = "gif" if result.is_gif else "png"
+    temporary = IMAGE_DIR / f"{image_id}.{image_format}.new"
+    temporary.write_bytes(result.data)
+    temporary.replace(image_path(image_id, image_format))
+    return image_format
+
+
+def remove_other_formats(image_id, image_format):
+    for other in MEDIA_TYPES:
+        if other != image_format:
+            image_path(image_id, other).unlink(missing_ok=True)
 
 
 IMAGE_QUERY = (
@@ -495,35 +540,42 @@ async def library():
 @app.post("/api/library", status_code=201)
 async def add_to_library(file: UploadFile = File(...), settings: dict = Depends(adjustments)):
     data = await read_upload(file, MAX_UPLOAD_BYTES)
-    png, _, _ = await convert_upload(data, settings)
+    result, _ = await convert_upload(data, settings)
     image_id = uuid.uuid4().hex
     name = Path(file.filename or "image").stem[:100] or "image"
 
     # the original is kept so an image can be converted differently later
     (IMAGE_DIR / f"{image_id}.original").write_bytes(data)
-    (IMAGE_DIR / f"{image_id}.png").write_bytes(png)
+    image_format = store_converted(image_id, result)
     with db() as connection:
         connection.execute(
-            "INSERT INTO images (id, name, bytes, created_at, settings) VALUES (?, ?, ?, ?, ?)",
-            (image_id, name, len(png), time.time(), json.dumps(settings)),
+            "INSERT INTO images (id, name, bytes, created_at, settings, format) VALUES (?, ?, ?, ?, ?, ?)",
+            (image_id, name, len(result.data), time.time(), json.dumps(settings), image_format),
         )
         row = connection.execute(f"{IMAGE_QUERY} WHERE images.id = ?", (image_id,)).fetchone()
     return image_row_to_dict(row)
 
 
 def require_image(image_id):
+    """Returns the image's format."""
     with db() as connection:
-        row = connection.execute("SELECT id FROM images WHERE id = ?", (image_id,)).fetchone()
+        row = connection.execute("SELECT format FROM images WHERE id = ?", (image_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "Image not found")
+    return row["format"]
 
 
-@app.get("/api/library/{image_id}.png")
-async def library_image(image_id: str):
-    require_image(image_id)
+@app.get("/api/library/{image_id}.{extension}")
+async def library_image(image_id: str, extension: str):
+    image_format = require_image(image_id)
+    # the address changes with the format, an old one no longer exists
+    if extension != image_format:
+        raise HTTPException(404, "Image not found")
     # images can change when they're adjusted, so browsers have to check for a new one
     return FileResponse(
-        IMAGE_DIR / f"{image_id}.png", media_type="image/png", headers={"Cache-Control": "no-cache"}
+        image_path(image_id, image_format),
+        media_type=MEDIA_TYPES[image_format],
+        headers={"Cache-Control": "no-cache"},
     )
 
 
@@ -547,26 +599,26 @@ async def adjust_library_image(image_id: str, settings: dict = Depends(adjustmen
     path = IMAGE_DIR / f"{image_id}.original"
     if not path.exists():
         raise HTTPException(404, "The original of this image is missing")
-    png, _, _ = await convert_upload(path.read_bytes(), settings)
+    result, _ = await convert_upload(path.read_bytes(), settings)
 
-    temporary = IMAGE_DIR / f"{image_id}.png.new"
-    temporary.write_bytes(png)
-    temporary.replace(IMAGE_DIR / f"{image_id}.png")
+    image_format = store_converted(image_id, result)
     with db() as connection:
         connection.execute(
-            "UPDATE images SET bytes = ?, settings = ? WHERE id = ?",
-            (len(png), json.dumps(settings), image_id),
+            "UPDATE images SET bytes = ?, settings = ?, format = ? WHERE id = ?",
+            (len(result.data), json.dumps(settings), image_format, image_id),
         )
         row = connection.execute(f"{IMAGE_QUERY} WHERE images.id = ?", (image_id,)).fetchone()
+    # removed once the database points at the new file, a playlist could be reading the old one
+    remove_other_formats(image_id, image_format)
     return image_row_to_dict(row)
 
 
 @app.post("/api/library/{image_id}/show")
 async def show_library_image(image_id: str):
-    require_image(image_id)
+    image_format = require_image(image_id)
     stop_player()
-    data = (IMAGE_DIR / f"{image_id}.png").read_bytes()
-    response = await board_request("POST", "/show-png", files={"file": ("image.png", data, "image/png")})
+    data = image_path(image_id, image_format).read_bytes()
+    response = await show_on_display(data)
     await refresh_status()
     return {"message": response.text}
 
@@ -576,7 +628,7 @@ async def delete_library_image(image_id: str):
     require_image(image_id)
     with db() as connection:
         connection.execute("DELETE FROM images WHERE id = ?", (image_id,))
-    for suffix in ("png", "original"):
+    for suffix in (*MEDIA_TYPES, "original"):
         (IMAGE_DIR / f"{image_id}.{suffix}").unlink(missing_ok=True)
 
 
@@ -790,6 +842,7 @@ async def limits():
     return {
         "size": SIZE[0],
         "max_png_bytes": MAX_BYTES,
+        "max_gif_bytes": MAX_GIF_BYTES,
         "max_upload_bytes": MAX_UPLOAD_BYTES,
         "min_duration": MIN_DURATION,
         "max_duration": MAX_DURATION,

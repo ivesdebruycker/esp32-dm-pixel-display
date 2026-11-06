@@ -143,7 +143,7 @@
     <label id="drop" class="dropzone">
       <input id="file" type="file" accept="image/*">
       <strong>Drop an image here or choose a file</strong>
-      <small>It's resized to 32×32 automatically, then you can adjust the crop</small>
+      <small>It's resized to 32×32 automatically, then you can adjust the crop. Animated GIFs keep moving</small>
     </label>
     <div id="result" hidden>
       <div class="image-column">
@@ -160,6 +160,9 @@
       </div>
       <div id="info">
         <p id="summary"></p>
+        <label id="animate-control" class="field" hidden>
+          <input id="animate" type="checkbox" checked> Animate
+        </label>
         <fieldset class="mode">
           <legend>Shape</legend>
           <label><input type="radio" name="mode" value="crop" checked> Crop to fill</label>
@@ -197,6 +200,7 @@
           <button id="add-library" type="button">Add to library</button>
           <button id="save" type="button">Save to board</button>
         </div>
+        <small id="save-hint" class="muted" hidden>The board's slideshow can only store still images. Turn off Animate to save the first frame</small>
       </div>
     </div>
   </section>
@@ -299,6 +303,7 @@ async function run(label, action) {
     setBusy(false);
     updatePlaylistButtons();
     // setBusy enables every button, these restore the ones that should stay disabled
+    updateImageButtons();
     renderPlaylistItems();
     renderLibrary();
     refreshStatus();
@@ -333,7 +338,7 @@ function formatBytes(bytes) {
 
 const DEFAULT_ADJUST = {
   mode: "crop", zoom: 1, x: 0.5, y: 0.5, background: "#000000",
-  contrast: 1, saturation: 1, resize: "smooth",
+  contrast: 1, saturation: 1, resize: "smooth", animate: true,
 };
 let adjust = { ...DEFAULT_ADJUST };
 let editingImage = null;
@@ -366,9 +371,27 @@ async function fetchPreview() {
 
   const colors = response.headers.get("X-Image-Colors");
   const original = response.headers.get("X-Original-Size");
+  const frames = Number(response.headers.get("X-Image-Frames"));
+  const sourceFrames = Number(response.headers.get("X-Source-Frames"));
+  let detail = "";
+  if (frames) {
+    detail = frames < sourceFrames ? `, ${frames} of ${sourceFrames} frames` : `, ${frames} frames`;
+  }
+  if (colors) detail += frames ? `, ${colors} colours` : `, reduced to ${colors} colours`;
   $("summary").textContent = `${sourceFile.name}: ${original} → 32×32, `
-    + formatBytes(response.headers.get("X-Image-Bytes"))
-    + (colors ? `, reduced to ${colors} colours` : "");
+    + formatBytes(response.headers.get("X-Image-Bytes")) + detail;
+  $("animate-control").hidden = sourceFrames < 2;
+  updateImageButtons();
+}
+
+function convertedIsGif() {
+  return Boolean(converted && converted.type === "image/gif");
+}
+
+function updateImageButtons() {
+  const gif = convertedIsGif();
+  $("save").disabled = busy || gif;
+  $("save-hint").hidden = !gif;
 }
 
 // the preview is created by the server, so wait for a pause in the changes
@@ -427,6 +450,7 @@ function drawAdjust() {
   $("pos-y").value = Math.round(adjust.y * 100);
   $("background").value = adjust.background;
   document.querySelectorAll('input[name="resize"]').forEach(input => { input.checked = input.value === adjust.resize; });
+  $("animate").checked = adjust.animate;
   ["contrast", "saturation"].forEach(name => {
     const percent = Math.round(adjust[name] * 100);
     $(name).value = percent;
@@ -468,7 +492,7 @@ function sendConverted(url, label) {
   run(label, async () => {
     await latestPreview();
     const form = new FormData();
-    form.append("file", converted, "image.png");
+    form.append("file", converted, convertedIsGif() ? "image.gif" : "image.png");
     const response = await post(url, form);
     return (await response.json()).message;
   });
@@ -834,6 +858,10 @@ document.querySelectorAll('input[name="resize"]').forEach(input => input.addEven
   adjust.resize = input.value;
   schedulePreview();
 }));
+$("animate").addEventListener("change", event => {
+  adjust.animate = event.target.checked;
+  schedulePreview();
+});
 ["contrast", "saturation"].forEach(name => $(name).addEventListener("input", event => {
   adjust[name] = Number(event.target.value) / 100;
   schedulePreview();

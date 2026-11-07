@@ -1,15 +1,18 @@
 """Web UI backend: converts images, runs playlists and passes requests on to the board."""
 import asyncio
 import io
+import ipaddress
 import json
 import logging
 import os
+import socket
 import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
@@ -42,12 +45,18 @@ CONNECT_TIMEOUT = 5
 # worth retrying the same image: the board or the display is away
 RETRY_STATUS_CODES = {502, 503, 504}
 STATIC_DIR = Path(__file__).parent / "static"
+# image links are fetched by the server, which can reach the home network, so slow
+# or redirecting links are cut off and links to local addresses are refused
+FETCH_SECONDS = 30
+MAX_REDIRECTS = 5
+MAX_LINK_LENGTH = 2000
 
 log = logging.getLogger("uvicorn.error")
 
 # The board's web server handles one client at a time, so requests take turns
 board_lock = asyncio.Lock()
 client: httpx.AsyncClient = None
+link_client: httpx.AsyncClient = None
 status = {"data": None, "checked_at": None, "failures": OFFLINE_AFTER_FAILURES}
 
 player = {
@@ -336,15 +345,23 @@ def resume_player():
 
 @asynccontextmanager
 async def lifespan(app):
-    global client
+    global client, link_client
     init_storage()
     client = httpx.AsyncClient(base_url=BOARD_URL)
+    # redirects are followed by hand, each one is checked like the link itself
+    link_client = httpx.AsyncClient(
+        follow_redirects=False,
+        trust_env=False,
+        timeout=httpx.Timeout(10),
+        headers={"User-Agent": "pixel-display-web-ui"},
+    )
     resume_player()
     tasks = [asyncio.create_task(poll_status()), asyncio.create_task(run_player())]
     yield
     for task in tasks:
         task.cancel()
     await client.aclose()
+    await link_client.aclose()
 
 
 app = FastAPI(title="Pixel display", lifespan=lifespan, docs_url=None, redoc_url=None)
@@ -413,6 +430,106 @@ async def convert_image(file: UploadFile = File(...), settings: dict = Depends(a
             "X-Source-Frames": str(result.source_frames),
             "X-Original-Size": f"{original_size[0]}x{original_size[1]}",
         },
+    )
+
+
+def is_public(address):
+    ip = ipaddress.ip_address(address.split("%")[0])
+    if ip.version == 6 and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    # not global covers private, loopback, link-local and Tailscale's 100.64.0.0/10
+    return ip.is_global and not ip.is_multicast
+
+
+async def public_address(host, port):
+    """Returns the address to connect to, refusing a name that points at a local one."""
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        raise HTTPException(400, f"Could not find {host}") from error
+    # a name can point at several addresses, every one has to be public
+    if not all(is_public(info[4][0]) for info in infos):
+        raise HTTPException(400, "Links to addresses on your own network aren't allowed")
+    return infos[0][4][0]
+
+
+async def open_link(url):
+    """Requests url, following redirects, and returns the response to stream."""
+    for _ in range(MAX_REDIRECTS + 1):
+        parts = urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise HTTPException(400, "Use a link that starts with http:// or https://")
+        if parts.username or parts.password:
+            raise HTTPException(400, "Links with a user name or password aren't allowed")
+        try:
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+        except ValueError as error:
+            raise HTTPException(400, "The link has an invalid port") from error
+
+        address = await public_address(parts.hostname, port)
+        # connect to the address that was checked, so the name can't point elsewhere in between
+        host = f"[{address}]" if ":" in address else address
+        request = link_client.build_request(
+            "GET",
+            parts._replace(netloc=f"{host}:{port}").geturl(),
+            headers={"Host": parts.netloc},
+            extensions={"sni_hostname": parts.hostname},
+        )
+        response = await link_client.send(request, stream=True)
+        if not response.is_redirect:
+            return response
+        await response.aclose()
+        url = urljoin(url, response.headers.get("location", ""))
+    raise HTTPException(400, "The link redirects too often")
+
+
+async def fetch_link(url):
+    response = await open_link(url)
+    try:
+        if response.status_code >= 400:
+            raise HTTPException(400, f"The link answered with error {response.status_code}")
+        data = bytearray()
+        async for chunk in response.aiter_bytes():
+            data += chunk
+            if len(data) > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, "The linked file is too large")
+    finally:
+        await response.aclose()
+    if not data:
+        raise HTTPException(400, "The link returned an empty file")
+    return bytes(data)
+
+
+def check_image(data):
+    with Image.open(io.BytesIO(data)):
+        pass
+
+
+class Link(BaseModel):
+    url: str = Field(min_length=1, max_length=MAX_LINK_LENGTH)
+
+
+@app.post("/api/fetch")
+async def fetch_image(body: Link):
+    """Returns the image a link points at, the page then uses it like an uploaded file."""
+    url = body.url.strip()
+    try:
+        async with asyncio.timeout(FETCH_SECONDS):
+            data = await fetch_link(url)
+    except (TimeoutError, httpx.TimeoutException) as error:
+        raise HTTPException(504, "The link took too long to load") from error
+    except httpx.HTTPError as error:
+        raise HTTPException(502, "Could not load the link") from error
+    try:
+        await run_in_threadpool(check_image, data)
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as error:
+        raise HTTPException(400, "The link doesn't point at an image, use a direct link to the file") from error
+
+    name = unquote(Path(urlsplit(url).path).stem)[:100] or "image"
+    return Response(
+        data,
+        media_type="application/octet-stream",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "X-File-Name": quote(name)},
     )
 
 

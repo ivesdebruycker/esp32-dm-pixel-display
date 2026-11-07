@@ -89,7 +89,9 @@
   #brightness-value { min-width: 3.5em; font-weight: 600; text-align: right; }
   .muted { color: var(--muted); margin: 0 0 12px; }
   .field { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; min-width: 0; }
-  select, input[type="number"] {
+  .link-row { margin-top: 8px; }
+  #link { flex: 1 1 220px; min-width: 0; }
+  select, input[type="number"], input[type="url"] {
     font: inherit; color: var(--text); background: var(--panel); min-height: 42px;
     border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; max-width: 100%;
   }
@@ -145,6 +147,10 @@
       <strong>Drop an image here or choose a file</strong>
       <small>It's resized to 32×32 automatically, then you can adjust the crop. Animated GIFs keep moving</small>
     </label>
+    <form id="link-form" class="actions link-row">
+      <input id="link" type="url" placeholder="Or paste a link to an image or GIF" aria-label="Link to an image or GIF">
+      <button id="load-link" type="submit">Load link</button>
+    </form>
     <div id="result" hidden>
       <div class="image-column">
         <span class="column-title">Original</span>
@@ -231,7 +237,7 @@
     <label id="library-drop" class="dropzone">
       <input id="library-files" type="file" accept="image/*" multiple>
       <strong>Drop images here to add them to the library</strong>
-      <small>Or choose several files. Each one is resized to 32×32 automatically</small>
+      <small>Or choose several files, or drop a link. Each one is resized to 32×32 automatically</small>
     </label>
     <p id="library-empty" class="muted">No images yet.</p>
     <ul id="library"></ul>
@@ -466,6 +472,10 @@ function showEditing() {
 
 function handleFile(file, image = null) {
   if (!file) return;
+  run(`Converting ${file.name}…`, () => openFile(file, image));
+}
+
+async function openFile(file, image = null) {
   sourceFile = file;
   editingImage = image;
   adjust = { ...DEFAULT_ADJUST, ...(image && image.settings ? image.settings : {}) };
@@ -474,17 +484,44 @@ function handleFile(file, image = null) {
   sourceUrl = URL.createObjectURL(file);
   $("source").src = sourceUrl;
 
-  run(`Converting ${file.name}…`, async () => {
-    clearTimeout(previewTimer);
-    previewTimer = null;
-    await fetchPreview();
-    $("result").hidden = false;
-    showEditing();
-    drawAdjust();
-    return image
-      ? `Adjusting ${image.name}. Save when it looks right.`
-      : "Ready. Adjust the crop if needed, then show or save it.";
+  clearTimeout(previewTimer);
+  previewTimer = null;
+  await fetchPreview();
+  $("result").hidden = false;
+  showEditing();
+  drawAdjust();
+  return image
+    ? `Adjusting ${image.name}. Save when it looks right.`
+    : "Ready. Adjust the crop if needed, then show or save it.";
+}
+
+// the server fetches it, the page can't read images from other sites itself
+async function fileFromLink(url) {
+  const response = await fetch("/api/fetch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
   });
+  if (!response.ok) throw new Error(await errorText(response));
+  const name = decodeURIComponent(response.headers.get("X-File-Name") || "image");
+  return new File([await response.blob()], name);
+}
+
+function loadLink(url) {
+  run("Loading the link…", async () => {
+    const file = await fileFromLink(url);
+    setMessage(`Converting ${file.name}…`, "busy");
+    const message = await openFile(file);
+    $("link").value = "";
+    return message;
+  });
+}
+
+// an image dragged from another page usually arrives as its link, not as a file
+function droppedLink(data) {
+  const text = data.getData("text/uri-list") || data.getData("text/plain");
+  const line = text.split(/\r?\n/).map(entry => entry.trim()).find(entry => entry && !entry.startsWith("#"));
+  return line && /^https?:\/\//i.test(line) ? line : null;
 }
 
 function sendConverted(url, label) {
@@ -778,7 +815,7 @@ $("file").addEventListener("change", event => {
   handleFile(event.target.files[0]);
   event.target.value = "";
 });
-function setUpDropzone(zone, onFiles) {
+function setUpDropzone(zone, onFiles, onLink) {
   ["dragenter", "dragover"].forEach(name => zone.addEventListener(name, event => {
     event.preventDefault();
     zone.classList.add("over");
@@ -787,10 +824,23 @@ function setUpDropzone(zone, onFiles) {
     event.preventDefault();
     zone.classList.remove("over");
   }));
-  zone.addEventListener("drop", event => onFiles(event.dataTransfer.files));
+  zone.addEventListener("drop", event => {
+    if (event.dataTransfer.files.length) {
+      onFiles(event.dataTransfer.files);
+      return;
+    }
+    const link = droppedLink(event.dataTransfer);
+    if (link) onLink(link);
+    else setMessage("Drop an image file, or a link to one", "error");
+  });
 }
-setUpDropzone($("drop"), files => handleFile(files[0]));
-setUpDropzone($("library-drop"), addFilesToLibrary);
+setUpDropzone($("drop"), files => handleFile(files[0]), loadLink);
+setUpDropzone($("library-drop"), addFilesToLibrary, addLinkToLibrary);
+$("link-form").addEventListener("submit", event => {
+  event.preventDefault();
+  const url = $("link").value.trim();
+  if (url) loadLink(url);
+});
 
 $("library-files").addEventListener("change", event => {
   // the list empties when the input is reset, so keep a copy
@@ -820,6 +870,18 @@ function addFilesToLibrary(fileList) {
       throw new Error(`Added ${added} of ${files.length}. Not added: ${failed.join("; ")}`);
     }
     return `Added ${added} image(s) to the library`;
+  });
+}
+
+function addLinkToLibrary(url) {
+  run("Loading the link…", async () => {
+    const file = await fileFromLink(url);
+    setMessage(`Adding ${file.name} to the library…`, "busy");
+    const form = new FormData();
+    form.append("file", file);
+    await post("/api/library", form);
+    await loadData();
+    return `Added ${file.name} to the library`;
   });
 }
 

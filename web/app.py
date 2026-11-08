@@ -50,6 +50,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 FETCH_SECONDS = 30
 MAX_REDIRECTS = 5
 MAX_LINK_LENGTH = 2000
+# the first command of reset() in python3-idotmatrix-library, its second one only sets
+# the brightness to 80% and is left out
+DISPLAY_RESET = "04000380"
 
 log = logging.getLogger("uvicorn.error")
 
@@ -603,6 +606,14 @@ async def screen(body: Screen):
     response = await board_request("POST", "/screen", data={"on": "1" if body.on else "0"})
     await refresh_status()
     return {"message": response.text}
+
+
+@app.post("/api/display/reset")
+async def reset_display():
+    """Sends the display's reset command, which made GIFs animate again when they stood still."""
+    await board_request("POST", "/send-raw", data={"plain": DISPLAY_RESET})
+    await refresh_status()
+    return {"message": "Display reset, it shows its own rainbow until the next image arrives"}
 
 
 @app.post("/api/images/clear")

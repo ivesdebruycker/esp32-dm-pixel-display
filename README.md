@@ -105,7 +105,7 @@ curl -X POST http://pixel-display.local/send-raw -d "plain=0500040101"
 
 Only `/update` needs a password, so keep the board off untrusted networks.
 
-The display keeps every GIF it receives and plays its own copy when it gets the same file again, even if that copy arrived broken. If a GIF stays on its first frame, change any byte and send it again. The web UI adds a random comment to each GIF it sends for this reason.
+The display keeps every GIF it receives and plays its own copy when it gets the same file again, even if that copy arrived broken. If a GIF stays on its first frame, change any byte and send it again. If no GIF animates any more, not even a new one, **Reset display** in the web UI sends the display's reset command, which brought them back. The display then shows its own rainbow animation until it gets the next image. The web UI adds a random comment to each GIF it sends for this reason.
 
 ## Web UI
 

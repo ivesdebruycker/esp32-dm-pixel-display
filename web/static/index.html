@@ -255,6 +255,7 @@
       <button id="slideshow-start" type="button">Start slideshow</button>
       <button id="slideshow-stop" type="button">Stop slideshow</button>
       <button id="clock" type="button">Show clock</button>
+      <button id="reset-display" type="button" title="Use this when animated GIFs stand still">Reset display</button>
       <span class="spacer"></span>
       <button id="clear" class="danger" type="button">Clear stored images</button>
     </div>
@@ -890,6 +891,7 @@ $("save").addEventListener("click", () => sendConverted("/api/save", "Saving to 
 $("slideshow-start").addEventListener("click", () => sendCommand("/api/slideshow/start", "Starting the slideshow…"));
 $("slideshow-stop").addEventListener("click", () => sendCommand("/api/slideshow/stop", "Stopping the slideshow…"));
 $("clock").addEventListener("click", () => sendCommand("/api/clock", "Starting the clock…"));
+$("reset-display").addEventListener("click", () => sendCommand("/api/display/reset", "Resetting the display…"));
 $("clear").addEventListener("click", () => {
   if (confirm("Remove all images stored on the board? This can't be undone.")) {
     sendCommand("/api/images/clear", "Removing the stored images…");
